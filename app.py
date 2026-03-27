@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 from datetime import datetime
 import hashlib
 import hmac
-import json
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -114,7 +113,7 @@ def check_password() -> bool:
 # ─── GOOGLE SHEETS CLIENT ─────────────────────────────────────────────────────
 @st.cache_resource
 def get_gc():
-    creds_dict = json.loads(st.secrets["gcp"]["service_account_json"])
+    creds_dict = dict(st.secrets["gcp"]["service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 

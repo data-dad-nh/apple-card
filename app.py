@@ -570,7 +570,9 @@ def page_transactions(sh):
         )
         base = base[mask]
     base = base[base["Amount (USD)"] >= min_amt]
-    base = base.sort_values("Transaction Date", ascending=False).reset_index(drop=True)
+    base = base.sort_values("Transaction Date", ascending=False)
+    base["_orig_idx"] = base.index  # preserve original df row position before reset
+    base = base.reset_index(drop=True)
 
     tc1, tc2, tc3 = st.columns(3)
     tc1.metric("Rows shown", len(base))
@@ -626,12 +628,10 @@ def page_transactions(sh):
 
         if save_clicked and n_changed:
             with st.spinner("Saving to Google Sheets…"):
-                # Apply edits back into the full df using original row indices
+                # Use _orig_idx to map edited rows back to correct positions in full df
                 full_df = df.copy()
-                changed_rows = base.index[changed_mask]
                 new_cats = edited.loc[changed_mask, "Category"].values
-                # base was derived from df; map back via the original integer index
-                orig_indices = base.iloc[changed_mask.nonzero()[0]].index
+                orig_indices = base.loc[changed_mask, "_orig_idx"].values
                 full_df.loc[orig_indices, "Category"] = new_cats
                 save_all_transactions(sh, full_df)
             st.success(f"✅ Saved {n_changed} category update(s)!")

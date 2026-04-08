@@ -429,7 +429,7 @@ def page_dashboard(sh):
         label_visibility="collapsed",
         placeholder="E.g. 'Concord day trip week of 2/21 — extra restaurant spend expected'"
     )
-    if st.button("Save Note"):
+    if st.button("Save Note", type="secondary"):
         save_note(sh, sel, new_note)
         st.success("Note saved!")
 
@@ -511,7 +511,7 @@ def page_upload(sh):
                 "remove manually from the Transactions page if needed."
             )
 
-    if st.button("💾 Import to Google Sheets", type="primary", use_container_width=True):
+    if st.button("💾 Import to Google Sheets", type="secondary", use_container_width=True):
         with st.spinner("Saving…"):
             df_save = df_new.copy()
             df_save["Transaction Date"] = df_save["Transaction Date"].astype(str)
@@ -620,7 +620,7 @@ def page_transactions(sh):
         with sc2:
             save_clicked = st.button(
                 f"💾 Save {n_changed} change(s)" if n_changed else "💾 Save Changes",
-                type="primary",
+                type="secondary",
                 disabled=(n_changed == 0),
                 use_container_width=True,
                 key="save_inline",
@@ -744,7 +744,7 @@ def page_budgets(sh):
     total = sum(updated.values())
     st.info(f"💡 Total monthly budget across all categories: **${total:,.2f}**")
 
-    if st.button("💾 Save Budgets", type="primary", use_container_width=True):
+    if st.button("💾 Save Budgets", type="secondary", use_container_width=True):
         with st.spinner("Saving…"):
             save_budgets(sh, updated)
         st.success("Budgets updated!")
@@ -996,7 +996,7 @@ def page_manage(sh):
     st.warning(f"This will permanently delete **{to_del_count}** transactions for {del_period}.")
 
     confirm = st.checkbox(f"Yes, delete all {del_period} transactions")
-    if confirm and st.button("🗑️ Delete", type="primary"):
+    if confirm and st.button("🗑️ Delete", type="secondary"):
         with st.spinner("Deleting…"):
             ws = get_or_create_worksheet(sh, "transactions")
             keep = df[df["Transaction Date"].dt.to_period("M") != pd.Period(del_period)].copy()
@@ -1036,12 +1036,12 @@ def main():
         )
         st.divider()
         st.caption(f"🕐 {datetime.now().strftime('%I:%M %p')}")
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh", use_container_width=True, type="secondary"):
             load_transactions.clear()
             load_budgets.clear()
             load_notes.clear()
             st.rerun()
-        if st.button("🔒 Log Out", use_container_width=True):
+        if st.button("🔒 Log Out", use_container_width=True, type="secondary"):
             st.session_state["authenticated"] = False
             st.rerun()
 

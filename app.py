@@ -855,7 +855,7 @@ def page_trends(sh):
         cmp.style
         .format({"Previous": "${:,.2f}", "Current": "${:,.2f}",
                  "Change": "${:+,.2f}", "Change %": "{:+.1f}%"})
-        .applymap(color_change, subset=["Change", "Change %"]),
+        .map(color_change, subset=["Change", "Change %"]),
         use_container_width=True,
     )
 

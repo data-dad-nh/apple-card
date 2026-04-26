@@ -45,6 +45,8 @@ BUDGET_HEADERS = ["Category", "Monthly Budget"]
 
 NOTES_HEADERS = ["Period", "Note", "Updated"]
 
+RULES_HEADERS = ["Merchant", "Category", "Created"]
+
 DEFAULT_BUDGETS = {
     "Grocery": 600.0,
     "Restaurants": 300.0,
@@ -164,6 +166,16 @@ def load_notes(_sh):
     return dict(zip(df["Period"], df["Note"]))
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def load_rules(_sh):
+    """Returns dict of {merchant: category} from the rules sheet."""
+    ws = get_or_create_worksheet(_sh, "rules")
+    data = ws.get_all_records()
+    if not data:
+        return {}
+    df = pd.DataFrame(data)
+    return dict(zip(df["Merchant"], df["Category"]))
+
 # ─── DATA SAVING ──────────────────────────────────────────────────────────────
 def save_transactions(sh, df_new: pd.DataFrame):
     ws = get_or_create_worksheet(sh, "transactions")
@@ -199,6 +211,50 @@ def save_note(sh, period: str, note: str):
             ws.append_rows([[period, note, now]])
     load_notes.clear()
 
+
+def save_rule(sh, merchant: str, category: str):
+    """Upsert a merchant → category rule into the rules sheet."""
+    ws = get_or_create_worksheet(sh, "rules")
+    data = ws.get_all_records()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not data:
+        ws.update([RULES_HEADERS, [merchant, category, now]])
+    else:
+        df = pd.DataFrame(data)
+        if merchant in df["Merchant"].values:
+            idx = df.index[df["Merchant"] == merchant][0] + 2
+            ws.update(f"A{idx}:C{idx}", [[merchant, category, now]])
+        else:
+            ws.append_rows([[merchant, category, now]])
+    load_rules.clear()
+
+
+def delete_rule(sh, merchant: str):
+    """Remove a rule by merchant name."""
+    ws = get_or_create_worksheet(sh, "rules")
+    data = ws.get_all_records()
+    if not data:
+        return
+    df = pd.DataFrame(data)
+    keep = df[df["Merchant"] != merchant]
+    ws.clear()
+    if not keep.empty:
+        ws.update([RULES_HEADERS] + keep.values.tolist())
+    else:
+        ws.update([RULES_HEADERS])
+    load_rules.clear()
+
+
+def apply_rules(df: pd.DataFrame, rules: dict) -> tuple[pd.DataFrame, int]:
+    """Apply merchant→category rules to df. Returns (updated_df, n_changed)."""
+    if not rules or df.empty:
+        return df, 0
+    df = df.copy()
+    mask = df["Merchant"].isin(rules) & (df["Type"] == "Purchase")
+    original = df.loc[mask, "Category"].copy()
+    df.loc[mask, "Category"] = df.loc[mask, "Merchant"].map(rules)
+    n_changed = int((df.loc[mask, "Category"] != original).sum())
+    return df, n_changed
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def get_purchases(df: pd.DataFrame) -> pd.DataFrame:
@@ -429,7 +485,7 @@ def page_dashboard(sh):
         label_visibility="collapsed",
         placeholder="E.g. 'Concord day trip week of 2/21 — extra restaurant spend expected'"
     )
-    if st.button("Save Note", type="secondary"):
+    if st.button("Save Note"):
         save_note(sh, sel, new_note)
         st.success("Note saved!")
 
@@ -455,11 +511,16 @@ def page_upload(sh):
     if uploaded is None:
         return
 
+
     try:
         df_new = parse_apple_card_csv(uploaded)
     except Exception as e:
         st.error(f"Could not parse file: {e}")
         return
+
+    # Apply saved merchant→category rules before preview
+    rules = load_rules(sh)
+    df_new, n_remapped = apply_rules(df_new, rules)
 
     purchases = df_new[df_new["Type"] == "Purchase"]
     payments = df_new[df_new["Type"] == "Payment"]
@@ -470,6 +531,15 @@ def page_upload(sh):
         f"✅ Parsed **{len(df_new)}** rows — "
         f"{', '.join(months_in)} {', '.join(set(years_in))}"
     )
+    if n_remapped:
+        st.info(f"🤖 **{n_remapped}** transaction(s) auto-remapped using your saved rules.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Purchases", len(purchases))
+    c2.metric("Payments / Credits", len(payments))
+    c3.metric("Gross Spend", f"${purchases['Amount (USD)'].sum():,.2f}")
+    c4.metric("Payments Applied", f"${abs(payments['Amount (USD)'].sum()):,.2f}")
+
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Purchases", len(purchases))
@@ -511,7 +581,7 @@ def page_upload(sh):
                 "remove manually from the Transactions page if needed."
             )
 
-    if st.button("💾 Import to Google Sheets", type="secondary", use_container_width=True):
+    if st.button("💾 Import to Google Sheets", type="primary", use_container_width=True):
         with st.spinner("Saving…"):
             df_save = df_new.copy()
             df_save["Transaction Date"] = df_save["Transaction Date"].astype(str)
@@ -620,7 +690,7 @@ def page_transactions(sh):
         with sc2:
             save_clicked = st.button(
                 f"💾 Save {n_changed} change(s)" if n_changed else "💾 Save Changes",
-                type="secondary",
+                type="primary",
                 disabled=(n_changed == 0),
                 use_container_width=True,
                 key="save_inline",
@@ -676,6 +746,13 @@ def page_transactions(sh):
         if total_str:
             st.caption(total_str)
 
+
+        save_as_rule = st.checkbox(
+            f"🤖 Save as rule — always categorize '{sel_merchant}' as {sel_new_cat} on future imports",
+            value=True,
+            key="bulk_save_rule",
+        )
+
         bulk_btn = bc3.button(
             f"Apply to {tx_count} rows",
             type="primary",
@@ -689,8 +766,11 @@ def page_transactions(sh):
                 full_df.loc[full_df["Merchant"] == sel_merchant, "Category"] = sel_new_cat
                 save_all_transactions(sh, full_df)
                 load_transactions.clear()
+                if save_as_rule:
+                    save_rule(sh, sel_merchant, sel_new_cat)
+            rule_note = " Rule saved! 🤖" if save_as_rule else ""
             st.success(
-                f"✅ Re-categorized all **{tx_count}** '{sel_merchant}' transactions → **{sel_new_cat}**"
+                f"✅ Re-categorized all **{tx_count}** '{sel_merchant}' transactions → **{sel_new_cat}**.{rule_note}"
             )
             st.rerun()
 
@@ -744,7 +824,7 @@ def page_budgets(sh):
     total = sum(updated.values())
     st.info(f"💡 Total monthly budget across all categories: **${total:,.2f}**")
 
-    if st.button("💾 Save Budgets", type="secondary", use_container_width=True):
+    if st.button("💾 Save Budgets", type="primary", use_container_width=True):
         with st.spinner("Saving…"):
             save_budgets(sh, updated)
         st.success("Budgets updated!")
@@ -965,6 +1045,107 @@ def page_insights(sh):
         )
 
 
+# ─── PAGE: RULES ─────────────────────────────────────────────────────────────
+def page_rules(sh):
+    st.title("🤖 Category Rules")
+    st.markdown(
+        "Rules automatically remap merchant categories on every import. "
+        "Create them here or via the **Bulk Re-categorize** tab in Transactions."
+    )
+
+    rules = load_rules(sh)
+    all_cats = sorted(list(DEFAULT_BUDGETS.keys()))
+
+    # ── Add rule manually ────────────────────────────────────────────────────
+    st.subheader("Add / Update a Rule")
+    df_tx = load_transactions(sh)
+    known_merchants = sorted(df_tx["Merchant"].dropna().unique().tolist()) if not df_tx.empty else []
+
+    ra1, ra2, ra3 = st.columns([3, 2, 1])
+    # Allow free-text or pick from known merchants
+    merchant_input = ra1.selectbox(
+        "Merchant", ["— type or select —"] + known_merchants, key="rule_merchant_sel"
+    )
+    if merchant_input == "— type or select —":
+        merchant_input = ra1.text_input(
+            "Or type merchant name", key="rule_merchant_text", label_visibility="collapsed",
+            placeholder="Type exact merchant name…"
+        ).strip()
+
+    cat_input = ra2.selectbox("Category", all_cats, key="rule_cat_sel")
+
+    if ra3.button("💾 Save Rule", type="primary", use_container_width=True, key="save_rule_btn"):
+        if merchant_input:
+            with st.spinner("Saving…"):
+                save_rule(sh, merchant_input, cat_input)
+            action = "Updated" if merchant_input in rules else "Added"
+            st.success(f"✅ {action} rule: **{merchant_input}** → **{cat_input}**")
+            st.rerun()
+        else:
+            st.warning("Please enter a merchant name.")
+
+    st.divider()
+
+    # ── Re-apply all rules to history ────────────────────────────────────────
+    st.subheader("Re-apply All Rules to History")
+    st.caption(
+        "Runs every saved rule against your entire transaction history and saves the result. "
+        "Useful after adding or editing rules."
+    )
+    if st.button("🔄 Re-apply All Rules Now", use_container_width=True, key="reapply_all"):
+        if not rules:
+            st.warning("No rules saved yet.")
+        elif df_tx.empty:
+            st.warning("No transaction history to update.")
+        else:
+            with st.spinner("Applying rules to full history…"):
+                updated_df, n_changed = apply_rules(df_tx, rules)
+                if n_changed:
+                    save_all_transactions(sh, updated_df)
+            if n_changed:
+                st.success(f"✅ Re-applied rules — **{n_changed}** transaction(s) updated.")
+            else:
+                st.info("No changes needed — all transactions already match your rules.")
+            st.rerun()
+
+    st.divider()
+
+    # ── Existing rules table ─────────────────────────────────────────────────
+    st.subheader(f"Saved Rules ({len(rules)})")
+
+    if not rules:
+        st.info(
+            "No rules yet. Add one above, or use the **Bulk Re-categorize** tab "
+            "in Transactions and check \"Save as rule\"."
+        )
+        return
+
+    rules_df = pd.DataFrame(
+        [(m, c) for m, c in rules.items()],
+        columns=["Merchant", "Category"]
+    ).sort_values("Merchant").reset_index(drop=True)
+
+    # Show table with per-row delete buttons
+    header_cols = st.columns([4, 3, 1])
+    header_cols[0].markdown("**Merchant**")
+    header_cols[1].markdown("**Category**")
+    header_cols[2].markdown("**Delete**")
+
+    for _, row in rules_df.iterrows():
+        rc1, rc2, rc3 = st.columns([4, 3, 1])
+        color = CATEGORY_COLORS.get(row["Category"], "#9E9E9E")
+        rc1.markdown(row["Merchant"])
+        rc2.markdown(
+            f'<span style="color:{color}">●</span> {row["Category"]}',
+            unsafe_allow_html=True,
+        )
+        if rc3.button("🗑️", key=f"del_rule_{row['Merchant']}", help=f"Delete rule for {row['Merchant']}"):
+            with st.spinner("Deleting…"):
+                delete_rule(sh, row["Merchant"])
+            st.success(f"Deleted rule for **{row['Merchant']}**")
+            st.rerun()
+
+
 # ─── PAGE: MANAGE DATA ────────────────────────────────────────────────────────
 def page_manage(sh):
     st.title("⚙️ Manage Data")
@@ -996,7 +1177,7 @@ def page_manage(sh):
     st.warning(f"This will permanently delete **{to_del_count}** transactions for {del_period}.")
 
     confirm = st.checkbox(f"Yes, delete all {del_period} transactions")
-    if confirm and st.button("🗑️ Delete", type="secondary"):
+    if confirm and st.button("🗑️ Delete", type="primary"):
         with st.spinner("Deleting…"):
             ws = get_or_create_worksheet(sh, "transactions")
             keep = df[df["Transaction Date"].dt.to_period("M") != pd.Period(del_period)].copy()
@@ -1030,18 +1211,20 @@ def main():
                 "🎯 Budgets",
                 "📈 Trends",
                 "💡 Insights",
+                "🤖 Rules",
                 "⚙️ Manage Data",
             ],
             label_visibility="collapsed",
         )
         st.divider()
         st.caption(f"🕐 {datetime.now().strftime('%I:%M %p')}")
-        if st.button("🔄 Refresh", use_container_width=True, type="secondary"):
+        if st.button("🔄 Refresh", use_container_width=True):
             load_transactions.clear()
             load_budgets.clear()
             load_notes.clear()
+            load_rules.clear()
             st.rerun()
-        if st.button("🔒 Log Out", use_container_width=True, type="secondary"):
+        if st.button("🔒 Log Out", use_container_width=True):
             st.session_state["authenticated"] = False
             st.rerun()
 
@@ -1052,6 +1235,7 @@ def main():
         "🎯 Budgets": page_budgets,
         "📈 Trends": page_trends,
         "💡 Insights": page_insights,
+        "🤖 Rules": page_rules,
         "⚙️ Manage Data": page_manage,
     }
     pages[page](sh)

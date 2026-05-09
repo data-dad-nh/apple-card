@@ -541,12 +541,6 @@ def page_upload(sh):
     c4.metric("Payments Applied", f"${abs(payments['Amount (USD)'].sum()):,.2f}")
 
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Purchases", len(purchases))
-    c2.metric("Payments / Credits", len(payments))
-    c3.metric("Gross Spend", f"${purchases['Amount (USD)'].sum():,.2f}")
-    c4.metric("Payments Applied", f"${abs(payments['Amount (USD)'].sum()):,.2f}")
-
     st.subheader("Preview (first 25 rows)")
     st.dataframe(
         df_new[["Transaction Date", "Merchant", "Category", "Amount (USD)", "Type"]].head(25),

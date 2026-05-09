@@ -554,9 +554,10 @@ def page_upload(sh):
         column_config={"Amount (USD)": st.column_config.NumberColumn(format="$%.2f")},
     )
 
-    # Duplicate detection
+    # ── Duplicate detection ────────────────────────────────────────────────
     existing_df = load_transactions(sh)
-    dupe_count = 0
+    dupe_mask = pd.Series([False] * len(df_new), dtype=bool)
+
     if not existing_df.empty:
         existing_keys = set(
             zip(
@@ -565,28 +566,101 @@ def page_upload(sh):
                 existing_df["Amount (USD)"].astype(str),
             )
         )
-        dupe_count = sum(
-            1
-            for k in zip(
+        new_keys = list(
+            zip(
                 df_new["Transaction Date"].astype(str),
                 df_new["Merchant"].astype(str),
                 df_new["Amount (USD)"].astype(str),
             )
-            if k in existing_keys
         )
-        if dupe_count:
-            st.warning(
-                f"⚠️ {dupe_count} transaction(s) look like possible duplicates "
-                "(same date + merchant + amount already exist). They'll still be imported; "
-                "remove manually from the Transactions page if needed."
+        dupe_mask = pd.Series(
+            [k in existing_keys for k in new_keys], dtype=bool
+        )
+
+    dupes_df = df_new[dupe_mask].copy()
+    clean_df = df_new[~dupe_mask].copy()
+
+    # ── Duplicate review UI ──────────────────────────────────────────────────
+    rows_to_exclude = set()
+
+    if not dupes_df.empty:
+        st.warning(
+            f"⚠️ **{len(dupes_df)}** transaction(s) look like possible duplicates "
+            "(same date + merchant + amount already in your history). "
+            "Review below — uncheck any that are legitimately separate transactions."
+        )
+
+        with st.expander(f"Review {len(dupes_df)} flagged transaction(s)", expanded=True):
+            st.caption(
+                "Checked rows will be **excluded** from this import. "
+                "Uncheck any that are real separate transactions (e.g. same coffee shop twice in one day)."
             )
 
-    if st.button("💾 Import to Google Sheets", type="primary", use_container_width=True):
+            # Header row
+            h0, h1, h2, h3, h4 = st.columns([1, 2, 3, 2, 2])
+            h0.markdown("**Skip?**")
+            h1.markdown("**Date**")
+            h2.markdown("**Merchant**")
+            h3.markdown("**Category**")
+            h4.markdown("**Amount**")
+
+            st.divider()
+
+            for i, (orig_idx, row) in enumerate(dupes_df.iterrows()):
+                c0, c1, c2, c3, c4 = st.columns([1, 2, 3, 2, 2])
+                exclude = c0.checkbox(
+                    "exclude",
+                    value=True,
+                    key=f"dupe_chk_{i}",
+                    label_visibility="collapsed",
+                )
+                c1.write(str(row["Transaction Date"])[:10])
+                c2.write(row["Merchant"])
+                c3.write(row["Category"])
+                c4.write(f"${float(row['Amount (USD)']):,.2f}")
+                if exclude:
+                    rows_to_exclude.add(i)
+
+            n_excluded = len(rows_to_exclude)
+            n_included = len(dupes_df) - n_excluded
+            if n_excluded:
+                st.info(
+                    f"**{n_excluded}** flagged row(s) will be skipped. "
+                    + (f"**{n_included}** flagged row(s) will still be imported as new transactions." if n_included else "")
+                )
+
+        # Build the final df to import: clean rows + any un-excluded dupes
+        included_dupes = [
+            row for i, (_, row) in enumerate(dupes_df.iterrows())
+            if i not in rows_to_exclude
+        ]
+        if included_dupes:
+            df_to_import = pd.concat(
+                [clean_df, pd.DataFrame(included_dupes)], ignore_index=True
+            )
+        else:
+            df_to_import = clean_df
+    else:
+        df_to_import = df_new
+        st.success("✅ No duplicates detected.")
+
+    # ── Import button ────────────────────────────────────────────────────────
+    n_importing = len(df_to_import)
+    n_skipping = len(df_new) - n_importing
+
+    btn_label = f"💾 Import {n_importing} transaction(s) to Google Sheets"
+    if n_skipping:
+        btn_label += f" (skipping {n_skipping} duplicate(s))"
+
+    if n_importing == 0:
+        st.warning("Nothing to import — all rows are duplicates and marked to skip.")
+    elif st.button(btn_label, type="primary", use_container_width=True):
         with st.spinner("Saving…"):
-            df_save = df_new.copy()
+            df_save = df_to_import.copy()
             df_save["Transaction Date"] = df_save["Transaction Date"].astype(str)
             save_transactions(sh, df_save)
-        st.success("Done! Head to the Dashboard to see your data.")
+        skipped_note = f" {n_skipping} duplicate(s) skipped." if n_skipping else ""
+        st.success(f"Done! Imported {n_importing} transaction(s).{skipped_note} Head to the Dashboard.")
         st.balloons()
 
 

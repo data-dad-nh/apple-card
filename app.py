@@ -46,6 +46,7 @@ BUDGET_HEADERS = ["Category", "Monthly Budget"]
 NOTES_HEADERS = ["Period", "Note", "Updated"]
 
 RULES_HEADERS = ["Merchant", "Category", "Created"]
+COMMENTS_HEADERS = ["Key", "Comment", "Updated"]
 
 DEFAULT_BUDGETS = {
     "Grocery": 600.0,
@@ -176,6 +177,35 @@ def load_rules(_sh):
     df = pd.DataFrame(data)
     return dict(zip(df["Merchant"], df["Category"]))
 
+
+def make_tx_key(date, merchant, amount) -> str:
+    """Stable fingerprint for a transaction used as the comments key."""
+    return f"{str(date)[:10]}|{merchant}|{amount}"
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def load_comments(_sh):
+    """Returns dict of {tx_key: comment} from the comments sheet."""
+    ws = get_or_create_worksheet(_sh, "comments")
+    data = ws.get_all_records()
+    if not data:
+        return {}
+    df = pd.DataFrame(data)
+    return dict(zip(df["Key"], df["Comment"]))
+
+
+def save_comments(sh, comments: dict):
+    """Overwrite entire comments sheet with the provided dict."""
+    ws = get_or_create_worksheet(sh, "comments")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows = [[k, v, now] for k, v in comments.items() if v and str(v).strip()]
+    ws.clear()
+    if rows:
+        ws.update([COMMENTS_HEADERS] + rows)
+    else:
+        ws.update([COMMENTS_HEADERS])
+    load_comments.clear()
+
 # ─── DATA SAVING ──────────────────────────────────────────────────────────────
 def save_transactions(sh, df_new: pd.DataFrame):
     ws = get_or_create_worksheet(sh, "transactions")
@@ -303,6 +333,7 @@ def page_dashboard(sh):
     df = load_transactions(sh)
     budgets = load_budgets(sh)
     notes = load_notes(sh)
+    comments = load_comments(sh)
 
     if df.empty or get_purchases(df).empty:
         st.info("👆 No data yet — head to **Upload** to add your first statement!")
@@ -341,7 +372,17 @@ def page_dashboard(sh):
     with c4:
         top_merchant = largest.iloc[0]["Merchant"] if len(largest) else "—"
         top_amt = largest.iloc[0]["Amount (USD)"] if len(largest) else 0
-        metric_card("Largest Purchase", f"${top_amt:,.2f}", top_merchant, "#9f7aea")
+        if len(largest):
+            top_key = make_tx_key(
+                largest.iloc[0]["Transaction Date"],
+                largest.iloc[0]["Merchant"],
+                largest.iloc[0]["Amount (USD)"],
+            )
+            top_comment = comments.get(top_key, "")
+            sub_label = f"💬 {top_comment}" if top_comment else top_merchant
+        else:
+            sub_label = "—"
+        metric_card("Largest Purchase", f"${top_amt:,.2f}", sub_label, "#9f7aea")
 
     st.divider()
 
@@ -506,6 +547,7 @@ def page_upload(sh):
 5. Choose **CSV** and save/share the file
         """)
 
+
     uploaded = st.file_uploader("Drop your Apple Card CSV here", type="csv")
 
     if uploaded is None:
@@ -539,7 +581,6 @@ def page_upload(sh):
     c2.metric("Payments / Credits", len(payments))
     c3.metric("Gross Spend", f"${purchases['Amount (USD)'].sum():,.2f}")
     c4.metric("Payments Applied", f"${abs(payments['Amount (USD)'].sum()):,.2f}")
-
 
     st.subheader("Preview (first 25 rows)")
     st.dataframe(
@@ -721,9 +762,16 @@ def page_transactions(sh):
 
     # ── Tab 1: Inline editor ──────────────────────────────────────────────────
     with tab_edit:
-        st.caption("Edit the **Category** column directly. Click a cell to change it, then save.")
+        st.caption("Edit **Category** or add a **Comment** to any row. Click a cell, then save.")
 
-        display_cols = ["Transaction Date", "Merchant", "Category", "Amount (USD)", "Purchased By", "Type"]
+        # Load existing comments and join onto base
+        comments = load_comments(sh)
+        base["_tx_key"] = base.apply(
+            lambda r: make_tx_key(r["Transaction Date"], r["Merchant"], r["Amount (USD)"]), axis=1
+        )
+        base["Comment"] = base["_tx_key"].map(comments).fillna("")
+
+        display_cols = ["Transaction Date", "Merchant", "Category", "Amount (USD)", "Purchased By", "Type", "Comment"]
         edit_df = base[display_cols].copy().rename(columns={"Amount (USD)": "Amount"})
 
         edited = st.data_editor(
@@ -742,17 +790,31 @@ def page_transactions(sh):
                 "Amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f", disabled=True),
                 "Purchased By": st.column_config.TextColumn("Purchased By", disabled=True),
                 "Type": st.column_config.TextColumn("Type", disabled=True),
+                "Comment": st.column_config.TextColumn(
+                    "💬 Comment",
+                    help="Optional note for this transaction",
+                    max_chars=200,
+                ),
             },
             key="tx_editor",
         )
 
-        changed_mask = edited["Category"].values != edit_df["Category"].values
-        n_changed = int(changed_mask.sum())
+        cat_changed_mask = edited["Category"].values != edit_df["Category"].values
+        comment_changed_mask = edited["Comment"].fillna("").values != edit_df["Comment"].fillna("").values
+        any_changed_mask = cat_changed_mask | comment_changed_mask
+        n_cat = int(cat_changed_mask.sum())
+        n_comment = int(comment_changed_mask.sum())
+        n_changed = int(any_changed_mask.sum())
 
         sc1, sc2 = st.columns([3, 1])
         with sc1:
-            if n_changed:
-                st.info(f"**{n_changed}** row(s) have unsaved category changes.")
+            parts = []
+            if n_cat:
+                parts.append(f"**{n_cat}** category change(s)")
+            if n_comment:
+                parts.append(f"**{n_comment}** comment change(s)")
+            if parts:
+                st.info(f"{' and '.join(parts)} unsaved.")
             else:
                 st.caption("No unsaved changes.")
         with sc2:
@@ -766,13 +828,27 @@ def page_transactions(sh):
 
         if save_clicked and n_changed:
             with st.spinner("Saving to Google Sheets…"):
-                # Use _orig_idx to map edited rows back to correct positions in full df
-                full_df = df.copy()
-                new_cats = edited.loc[changed_mask, "Category"].values
-                orig_indices = base.loc[changed_mask, "_orig_idx"].values
-                full_df.loc[orig_indices, "Category"] = new_cats
-                save_all_transactions(sh, full_df)
-            st.success(f"✅ Saved {n_changed} category update(s)!")
+                # Save category changes back to transactions sheet
+                if n_cat:
+                    full_df = df.copy()
+                    new_cats = edited.loc[cat_changed_mask, "Category"].values
+                    orig_indices = base.loc[cat_changed_mask, "_orig_idx"].values
+                    full_df.loc[orig_indices, "Category"] = new_cats
+                    save_all_transactions(sh, full_df)
+
+                # Save comment changes to comments sheet
+                if n_comment:
+                    updated_comments = dict(comments)  # copy existing
+                    for i, row in edited[comment_changed_mask].iterrows():
+                        key = base.loc[i, "_tx_key"]
+                        new_comment = str(row["Comment"]).strip() if row["Comment"] else ""
+                        if new_comment:
+                            updated_comments[key] = new_comment
+                        elif key in updated_comments:
+                            del updated_comments[key]  # blank comment = delete it
+                    save_comments(sh, updated_comments)
+
+            st.success(f"✅ Saved {n_changed} change(s)!")
             st.rerun()
 
         st.divider()
@@ -1291,6 +1367,7 @@ def main():
             load_budgets.clear()
             load_notes.clear()
             load_rules.clear()
+            load_comments.clear()
             st.rerun()
         if st.button("🔒 Log Out", use_container_width=True):
             st.session_state["authenticated"] = False

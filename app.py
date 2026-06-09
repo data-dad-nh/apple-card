@@ -983,90 +983,13 @@ def page_trends(sh):
         st.info("Need at least one month of data.")
         return
 
-    purchases = get_purchases(df)
-    purchases = purchases.copy()
+    purchases = get_purchases(df).copy()
     purchases["Period"] = purchases["Transaction Date"].dt.to_period("M").astype(str)
-
-    # Monthly total line
-    monthly = (
-        purchases.groupby("Period")["Amount (USD)"]
-        .sum()
-        .reset_index()
-        .rename(columns={"Amount (USD)": "Total"})
-        .sort_values("Period")
-    )
+    purchases["Year"]   = purchases["Transaction Date"].dt.year.astype(str)
+    purchases["Month#"] = purchases["Transaction Date"].dt.month
 
     budgets = load_budgets(sh)
     total_budget = sum(v for k, v in budgets.items())
-    monthly["Budget"] = total_budget
-
-    st.subheader("Monthly Spending")
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=monthly["Period"], y=monthly["Total"],
-        name="Spent", marker_color="#667eea",
-    ))
-    fig.add_trace(go.Scatter(
-        x=monthly["Period"], y=monthly["Budget"],
-        name="Budget", line=dict(color="#e53e3e", width=2, dash="dash"),
-    ))
-    fig.update_layout(
-        height=300, margin=dict(t=10, b=10, l=0, r=0),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # Category heatmap
-    st.subheader("Category Heatmap by Month")
-    cat_monthly = purchases.groupby(["Period", "Category"])["Amount (USD)"].sum().reset_index()
-    pivot = cat_monthly.pivot(index="Category", columns="Period", values="Amount (USD)").fillna(0)
-
-    fig2 = px.imshow(
-        pivot,
-        color_continuous_scale="Blues",
-        aspect="auto",
-        text_auto="$.0f",
-    )
-    fig2.update_layout(height=380, margin=dict(t=10, b=10, l=0, r=0))
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.divider()
-
-    # MoM comparison
-    periods_avail = sorted(purchases["Period"].unique())
-    if len(periods_avail) < 2:
-        st.info("Upload at least 2 months of data to compare.")
-        return
-
-    st.subheader("Month-over-Month Comparison")
-    cc1, cc2 = st.columns(2)
-    p1 = cc1.selectbox("From", periods_avail, index=len(periods_avail) - 2, key="p1")
-    p2 = cc2.selectbox("To", periods_avail, index=len(periods_avail) - 1, key="p2")
-
-    s1 = purchases[purchases["Period"] == p1].groupby("Category")["Amount (USD)"].sum()
-    s2 = purchases[purchases["Period"] == p2].groupby("Category")["Amount (USD)"].sum()
-    cmp = pd.DataFrame({"Previous": s1, "Current": s2}).fillna(0).reset_index()
-    cmp["Change"] = cmp["Current"] - cmp["Previous"]
-    cmp["Change %"] = (
-        cmp["Change"] / cmp["Previous"].replace(0, float("nan")) * 100
-    ).round(1)
-    cmp = cmp.sort_values("Change", ascending=False)
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Bar(x=cmp["Category"], y=cmp["Previous"],
-                          name=p1, marker_color="rgba(100,126,234,0.45)"))
-    fig3.add_trace(go.Bar(x=cmp["Category"], y=cmp["Current"],
-                          name=p2, marker_color="#667eea"))
-    fig3.update_layout(
-        barmode="group", height=320,
-        margin=dict(t=10, b=10, l=0, r=0),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig3, use_container_width=True)
 
     def color_change(val):
         if isinstance(val, float) and val > 0:
@@ -1075,13 +998,321 @@ def page_trends(sh):
             return "color:#38a169"
         return ""
 
-    st.dataframe(
-        cmp.style
-        .format({"Previous": "${:,.2f}", "Current": "${:,.2f}",
-                 "Change": "${:+,.2f}", "Change %": "{:+.1f}%"})
-        .map(color_change, subset=["Change", "Change %"]),
-        use_container_width=True,
+    CHART_LAYOUT = dict(
+        margin=dict(t=10, b=10, l=0, r=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
     )
+
+    tab_monthly, tab_heatmap, tab_mom, tab_year, tab_yoy = st.tabs([
+        "📅 Monthly", "🌡️ Heatmap", "↔️ Month-over-Month",
+        "📆 Year View", "📊 Year-over-Year",
+    ])
+
+    # ── Tab 1: Monthly ────────────────────────────────────────────────────────
+    with tab_monthly:
+        monthly = (
+            purchases.groupby("Period")["Amount (USD)"]
+            .sum().reset_index()
+            .rename(columns={"Amount (USD)": "Total"})
+            .sort_values("Period")
+        )
+        monthly["Budget"] = total_budget
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=monthly["Period"], y=monthly["Total"],
+            name="Spent", marker_color="#667eea",
+        ))
+        fig.add_trace(go.Scatter(
+            x=monthly["Period"], y=monthly["Budget"],
+            name="Budget", line=dict(color="#e53e3e", width=2, dash="dash"),
+        ))
+        fig.update_layout(height=320, **CHART_LAYOUT)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 2: Heatmap ────────────────────────────────────────────────────────
+    with tab_heatmap:
+        cat_monthly = purchases.groupby(["Period", "Category"])["Amount (USD)"].sum().reset_index()
+        pivot = cat_monthly.pivot(index="Category", columns="Period", values="Amount (USD)").fillna(0)
+        fig2 = px.imshow(
+            pivot, color_continuous_scale="Blues",
+            aspect="auto", text_auto="$.0f",
+        )
+        fig2.update_layout(height=400, margin=dict(t=10, b=10, l=0, r=0))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Tab 3: Month-over-Month ───────────────────────────────────────────────
+    with tab_mom:
+        periods_avail = sorted(purchases["Period"].unique())
+        if len(periods_avail) < 2:
+            st.info("Upload at least 2 months of data to compare.")
+        else:
+            cc1, cc2 = st.columns(2)
+            p1 = cc1.selectbox("From", periods_avail, index=len(periods_avail) - 2, key="p1")
+            p2 = cc2.selectbox("To",   periods_avail, index=len(periods_avail) - 1, key="p2")
+
+            s1  = purchases[purchases["Period"] == p1].groupby("Category")["Amount (USD)"].sum()
+            s2  = purchases[purchases["Period"] == p2].groupby("Category")["Amount (USD)"].sum()
+            cmp = pd.DataFrame({"Previous": s1, "Current": s2}).fillna(0).reset_index()
+            cmp["Change"]   = cmp["Current"] - cmp["Previous"]
+            cmp["Change %"] = (cmp["Change"] / cmp["Previous"].replace(0, float("nan")) * 100).round(1)
+            cmp = cmp.sort_values("Change", ascending=False)
+
+            fig3 = go.Figure()
+            fig3.add_trace(go.Bar(x=cmp["Category"], y=cmp["Previous"],
+                                  name=p1, marker_color="rgba(100,126,234,0.45)"))
+            fig3.add_trace(go.Bar(x=cmp["Category"], y=cmp["Current"],
+                                  name=p2, marker_color="#667eea"))
+            fig3.update_layout(barmode="group", height=320, **CHART_LAYOUT)
+            st.plotly_chart(fig3, use_container_width=True)
+
+            st.dataframe(
+                cmp.style
+                .format({"Previous": "${:,.2f}", "Current": "${:,.2f}",
+                         "Change": "${:+,.2f}", "Change %": "{:+.1f}%"})
+                .map(color_change, subset=["Change", "Change %"]),
+                use_container_width=True,
+            )
+
+    # ── Tab 4: Year View ──────────────────────────────────────────────────────
+    with tab_year:
+        years_avail = sorted(purchases["Year"].unique(), reverse=True)
+        sel_year = st.selectbox("Year", years_avail, key="year_sel")
+        yr_df = purchases[purchases["Year"] == sel_year]
+
+        if yr_df.empty:
+            st.info("No data for this year.")
+        else:
+            total_yr     = yr_df["Amount (USD)"].sum()
+            months_in_yr = yr_df["Period"].nunique()
+            avg_monthly  = total_yr / months_in_yr if months_in_yr else 0
+            biggest_mo   = yr_df.groupby("Period")["Amount (USD)"].sum().idxmax()
+            biggest_mo_amt = yr_df.groupby("Period")["Amount (USD)"].sum().max()
+            top_cat      = yr_df.groupby("Category")["Amount (USD)"].sum().idxmax()
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                metric_card("Total Spent", f"${total_yr:,.2f}",
+                            f"{months_in_yr} month(s) of data", "#667eea")
+            with k2:
+                over_budget_months = int(
+                    (yr_df.groupby("Period")["Amount (USD)"].sum() > total_budget).sum()
+                )
+                metric_card("Avg / Month", f"${avg_monthly:,.2f}",
+                            f"{over_budget_months} month(s) over budget", "#48bb78")
+            with k3:
+                metric_card("Biggest Month", f"${biggest_mo_amt:,.2f}",
+                            biggest_mo, "#ed8936")
+            with k4:
+                top_cat_amt = yr_df.groupby("Category")["Amount (USD)"].sum().max()
+                metric_card("Top Category", f"${top_cat_amt:,.2f}",
+                            top_cat, "#9f7aea")
+
+            st.divider()
+
+            # 12-month bar chart for the selected year
+            ALL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
+                          "Jul","Aug","Sep","Oct","Nov","Dec"]
+            mo_spend = yr_df.groupby("Month#")["Amount (USD)"].sum().reset_index()
+            mo_spend["Month"] = mo_spend["Month#"].apply(lambda m: ALL_MONTHS[m - 1])
+            # Fill missing months with zero
+            full_mo = pd.DataFrame({"Month#": range(1, 13), "Month": ALL_MONTHS})
+            mo_spend = full_mo.merge(mo_spend, on=["Month#", "Month"], how="left").fillna(0)
+
+            fig_yr = go.Figure()
+            fig_yr.add_trace(go.Bar(
+                x=mo_spend["Month"], y=mo_spend["Amount (USD)"],
+                name="Spent",
+                marker_color=[
+                    "#e53e3e" if v > total_budget else "#667eea"
+                    for v in mo_spend["Amount (USD)"]
+                ],
+            ))
+            fig_yr.add_hline(
+                y=total_budget, line_dash="dash",
+                line_color="#e53e3e", annotation_text="Monthly Budget",
+                annotation_position="top left",
+            )
+            fig_yr.update_layout(height=320, showlegend=False, **CHART_LAYOUT)
+            st.plotly_chart(fig_yr, use_container_width=True)
+
+            st.divider()
+
+            # Category breakdown for the year
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.subheader("Category Breakdown")
+                cat_yr = yr_df.groupby("Category")["Amount (USD)"].sum().reset_index()
+                cat_yr["Annual Budget"] = cat_yr["Category"].map(
+                    {k: v * 12 for k, v in budgets.items()}
+                ).fillna(0)
+                cat_yr["vs Budget"] = cat_yr["Amount (USD)"] - cat_yr["Annual Budget"]
+                cat_yr = cat_yr.sort_values("Amount (USD)", ascending=False)
+                st.dataframe(
+                    cat_yr.style.format({
+                        "Amount (USD)":   "${:,.2f}",
+                        "Annual Budget":  "${:,.2f}",
+                        "vs Budget":      "${:+,.2f}",
+                    }).map(color_change, subset=["vs Budget"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with col_r:
+                st.subheader("Spend Distribution")
+                fig_pie = px.pie(
+                    cat_yr, values="Amount (USD)", names="Category",
+                    color="Category", color_discrete_map=CATEGORY_COLORS, hole=0.4,
+                )
+                fig_pie.update_layout(
+                    height=340, margin=dict(t=10, b=10, l=0, r=0),
+                    legend=dict(font=dict(size=11)),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+    # ── Tab 5: Year-over-Year ─────────────────────────────────────────────────
+    with tab_yoy:
+        years_avail_asc = sorted(purchases["Year"].unique())
+
+        if len(years_avail_asc) < 2:
+            st.info("Upload data from at least 2 calendar years to enable this view.")
+        else:
+            yc1, yc2 = st.columns(2)
+            y1 = yc1.selectbox("Base Year",       years_avail_asc,
+                               index=len(years_avail_asc) - 2, key="yoy_y1")
+            y2 = yc2.selectbox("Comparison Year", years_avail_asc,
+                               index=len(years_avail_asc) - 1, key="yoy_y2")
+
+            y1_df = purchases[purchases["Year"] == y1]
+            y2_df = purchases[purchases["Year"] == y2]
+
+            # ── Top-line KPIs ────────────────────────────────────────────────
+            y1_total = y1_df["Amount (USD)"].sum()
+            y2_total = y2_df["Amount (USD)"].sum()
+            delta_total = y2_total - y1_total
+            delta_pct   = (delta_total / y1_total * 100) if y1_total else 0
+
+            y1_mo_avg = y1_total / max(y1_df["Period"].nunique(), 1)
+            y2_mo_avg = y2_total / max(y2_df["Period"].nunique(), 1)
+
+            kc1, kc2, kc3, kc4 = st.columns(4)
+            with kc1:
+                metric_card(f"{y1} Total", f"${y1_total:,.2f}",
+                            f"{y1_df['Period'].nunique()} months", "#667eea")
+            with kc2:
+                metric_card(f"{y2} Total", f"${y2_total:,.2f}",
+                            f"{y2_df['Period'].nunique()} months",
+                            "#e53e3e" if delta_total > 0 else "#48bb78")
+            with kc3:
+                sign = "+" if delta_total >= 0 else ""
+                metric_card("Δ Total Spend",
+                            f"{sign}${delta_total:,.2f}",
+                            f"{sign}{delta_pct:.1f}% year over year",
+                            "#e53e3e" if delta_total > 0 else "#48bb78")
+            with kc4:
+                mo_delta = y2_mo_avg - y1_mo_avg
+                sign = "+" if mo_delta >= 0 else ""
+                metric_card("Δ Monthly Avg",
+                            f"{sign}${mo_delta:,.2f}",
+                            f"{y1}: ${y1_mo_avg:,.0f}  →  {y2}: ${y2_mo_avg:,.0f}",
+                            "#e53e3e" if mo_delta > 0 else "#48bb78")
+
+            st.divider()
+
+            # ── Month-by-month overlay ───────────────────────────────────────
+            st.subheader("Month-by-Month Overlay")
+            ALL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
+                          "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+            def monthly_by_year(yr_purchases, label):
+                mo = yr_purchases.groupby("Month#")["Amount (USD)"].sum().reset_index()
+                full = pd.DataFrame({"Month#": range(1, 13), "Month": ALL_MONTHS})
+                mo = full.merge(mo, on="Month#", how="left").fillna(0)
+                mo["Year"] = label
+                return mo
+
+            y1_mo = monthly_by_year(y1_df, y1)
+            y2_mo = monthly_by_year(y2_df, y2)
+
+            fig_ov = go.Figure()
+            fig_ov.add_trace(go.Scatter(
+                x=y1_mo["Month"], y=y1_mo["Amount (USD)"],
+                name=y1, mode="lines+markers",
+                line=dict(color="rgba(102,126,234,0.55)", width=2, dash="dot"),
+                marker=dict(size=6),
+            ))
+            fig_ov.add_trace(go.Scatter(
+                x=y2_mo["Month"], y=y2_mo["Amount (USD)"],
+                name=y2, mode="lines+markers",
+                line=dict(color="#667eea", width=2),
+                marker=dict(size=7),
+            ))
+            fig_ov.add_hline(
+                y=total_budget, line_dash="dash",
+                line_color="#e53e3e", annotation_text="Monthly Budget",
+                annotation_position="top left",
+            )
+            fig_ov.update_layout(height=320, **CHART_LAYOUT)
+            st.plotly_chart(fig_ov, use_container_width=True)
+
+            st.divider()
+
+            # ── Category YoY table + chart ───────────────────────────────────
+            st.subheader("Category Comparison")
+            s_y1 = y1_df.groupby("Category")["Amount (USD)"].sum()
+            s_y2 = y2_df.groupby("Category")["Amount (USD)"].sum()
+            yoy  = pd.DataFrame({y1: s_y1, y2: s_y2}).fillna(0).reset_index()
+            yoy["Δ $"]  = yoy[y2] - yoy[y1]
+            yoy["Δ %"]  = (yoy["Δ $"] / yoy[y1].replace(0, float("nan")) * 100).round(1)
+            yoy = yoy.sort_values("Δ $", ascending=False)
+
+            fig_yoy = go.Figure()
+            fig_yoy.add_trace(go.Bar(
+                x=yoy["Category"], y=yoy[y1],
+                name=y1, marker_color="rgba(102,126,234,0.45)",
+            ))
+            fig_yoy.add_trace(go.Bar(
+                x=yoy["Category"], y=yoy[y2],
+                name=y2, marker_color="#667eea",
+            ))
+            fig_yoy.update_layout(barmode="group", height=320, **CHART_LAYOUT)
+            st.plotly_chart(fig_yoy, use_container_width=True)
+
+            st.dataframe(
+                yoy.style
+                .format({y1: "${:,.2f}", y2: "${:,.2f}",
+                         "Δ $": "${:+,.2f}", "Δ %": "{:+.1f}%"})
+                .map(color_change, subset=["Δ $", "Δ %"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.divider()
+
+            # ── Callout cards ────────────────────────────────────────────────
+            st.subheader("Notable Changes")
+            yoy_valid = yoy[yoy[y1] > 0].copy()
+            if not yoy_valid.empty:
+                most_improved = yoy_valid.loc[yoy_valid["Δ $"].idxmin()]
+                most_worsened = yoy_valid.loc[yoy_valid["Δ $"].idxmax()]
+
+                nc1, nc2 = st.columns(2)
+                with nc1:
+                    delta_str = f"${most_improved['Δ $']:+,.2f} ({most_improved['Δ %']:+.1f}%)"
+                    metric_card(
+                        "✅ Most Improved Category",
+                        most_improved["Category"],
+                        delta_str, "#38a169",
+                    )
+                with nc2:
+                    delta_str = f"${most_worsened['Δ $']:+,.2f} ({most_worsened['Δ %']:+.1f}%)"
+                    metric_card(
+                        "⚠️ Largest Increase",
+                        most_worsened["Category"],
+                        delta_str, "#e53e3e",
+                    )
 
 
 # ─── PAGE: INSIGHTS ───────────────────────────────────────────────────────────

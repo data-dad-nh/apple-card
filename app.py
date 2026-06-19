@@ -146,6 +146,7 @@ def load_transactions(_sh):
     df["Transaction Date"] = pd.to_datetime(df["Transaction Date"], errors="coerce")
     if "Source" not in df.columns:
         df["Source"] = "Import"
+    df["Source"] = df["Source"].replace("", "Import").fillna("Import")
     return df
 
 
@@ -211,12 +212,31 @@ def save_comments(sh, comments: dict):
 # ─── DATA SAVING ──────────────────────────────────────────────────────────────
 def save_transactions(sh, df_new: pd.DataFrame):
     ws = get_or_create_worksheet(sh, "transactions")
-    has_data = bool(ws.get_all_values())
-    rows = [list(map(str, row)) for row in df_new.itertuples(index=False, name=None)]
-    if not has_data:
-        ws.update([TRANSACTION_HEADERS] + rows)
+    existing = ws.get_all_values()
+    has_data = bool(existing)
+
+    # If sheet header is outdated (missing Source or other new columns),
+    # rewrite the full sheet so the header and all rows stay in sync.
+    if has_data and existing[0] != TRANSACTION_HEADERS:
+        old_headers = existing[0]
+        data_rows = existing[1:]
+        # Pad / remap each row to match the current TRANSACTION_HEADERS
+        migrated = []
+        for row in data_rows:
+            row_dict = dict(zip(old_headers, row))
+            if "Source" not in row_dict or not row_dict["Source"]:
+                row_dict["Source"] = "Import"
+            migrated.append([row_dict.get(h, "") for h in TRANSACTION_HEADERS])
+        # Append the new rows too
+        new_rows = [list(map(str, r)) for r in df_new.itertuples(index=False, name=None)]
+        ws.clear()
+        ws.update([TRANSACTION_HEADERS] + migrated + new_rows)
     else:
-        ws.append_rows(rows)
+        new_rows = [list(map(str, r)) for r in df_new.itertuples(index=False, name=None)]
+        if not has_data:
+            ws.update([TRANSACTION_HEADERS] + new_rows)
+        else:
+            ws.append_rows(new_rows)
     load_transactions.clear()
 
 

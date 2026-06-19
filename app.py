@@ -38,7 +38,7 @@ st.markdown("""
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 TRANSACTION_HEADERS = [
     "Transaction Date", "Clearing Date", "Description", "Merchant",
-    "Category", "Type", "Amount (USD)", "Purchased By", "Month", "Year", "Upload Date",
+    "Category", "Type", "Amount (USD)", "Purchased By", "Month", "Year", "Upload Date", "Source",
 ]
 
 BUDGET_HEADERS = ["Category", "Monthly Budget"]
@@ -144,6 +144,8 @@ def load_transactions(_sh):
     df = pd.DataFrame(data)
     df["Amount (USD)"] = pd.to_numeric(df["Amount (USD)"], errors="coerce").fillna(0)
     df["Transaction Date"] = pd.to_datetime(df["Transaction Date"], errors="coerce")
+    if "Source" not in df.columns:
+        df["Source"] = "Import"
     return df
 
 
@@ -298,6 +300,7 @@ def parse_apple_card_csv(uploaded_file) -> pd.DataFrame:
     df["Month"] = df["Transaction Date"].dt.strftime("%B")
     df["Year"] = df["Transaction Date"].dt.year.astype(str)
     df["Upload Date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["Source"] = "Import"
     for col in TRANSACTION_HEADERS:
         if col not in df.columns:
             df[col] = ""
@@ -1521,6 +1524,117 @@ def page_rules(sh):
             st.rerun()
 
 
+# ─── PAGE: MANUAL ENTRY ──────────────────────────────────────────────────────
+def page_manual_entry(sh):
+    st.title("✏️ Manual Entry")
+
+    all_cats = sorted(list(DEFAULT_BUDGETS.keys()))
+    tab_add, tab_manage = st.tabs(["➕ Add Transaction", "🗑️ Manage Manual Entries"])
+
+    # ── Tab 1: Add a transaction ───────────────────────────────────────────────
+    with tab_add:
+        st.markdown("Manually log a transaction that doesn't appear on your Apple Card statement.")
+
+        with st.form("manual_entry_form", clear_on_submit=True):
+            fc1, fc2 = st.columns(2)
+            tx_date = fc1.date_input("Date", value=datetime.today())
+            merchant = fc2.text_input("Merchant / Payee", placeholder="e.g. Flatbread Pizza")
+
+            fc3, fc4, fc5 = st.columns(3)
+            category  = fc3.selectbox("Category", all_cats)
+            tx_type   = fc4.selectbox("Type", ["Purchase", "Payment / Credit"])
+            amount    = fc5.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f")
+
+            description  = st.text_input("Description (optional)", placeholder="e.g. Birthday dinner")
+            purchased_by = st.text_input("Purchased By (optional)", placeholder="Your name")
+
+            submitted = st.form_submit_button("💾 Save Transaction", type="primary", use_container_width=True)
+
+        if submitted:
+            if not merchant.strip():
+                st.error("Merchant / Payee is required.")
+            elif amount <= 0:
+                st.error("Amount must be greater than $0.")
+            else:
+                tx_dt = pd.Timestamp(tx_date)
+                # Payments/credits stored as negative to match Apple Card convention
+                stored_amount = -abs(amount) if "Payment" in tx_type else abs(amount)
+                new_row = pd.DataFrame([{
+                    "Transaction Date": str(tx_dt.date()),
+                    "Clearing Date":    str(tx_dt.date()),
+                    "Description":      description.strip(),
+                    "Merchant":         merchant.strip(),
+                    "Category":         category,
+                    "Type":             "Payment" if "Payment" in tx_type else "Purchase",
+                    "Amount (USD)":     stored_amount,
+                    "Purchased By":     purchased_by.strip() or "Manual Entry",
+                    "Month":            tx_dt.strftime("%B"),
+                    "Year":             str(tx_dt.year),
+                    "Upload Date":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Source":           "Manual",
+}])
+                with st.spinner("Saving…"):
+                    save_transactions(sh, new_row)
+                st.success(
+                    f"✅ Saved: **{merchant.strip()}** — "
+                    f"${abs(stored_amount):,.2f} on {tx_dt.strftime('%B %d, %Y')}"
+                )
+
+    # ── Tab 2: Manage / delete manual entries ─────────────────────────────────
+    with tab_manage:
+        df = load_transactions(sh)
+
+        manual = df[df["Source"] == "Manual"].copy().sort_values(
+            "Transaction Date", ascending=False
+        ).reset_index(drop=True)
+
+        if manual.empty:
+            st.info("No manual entries yet — add one in the **Add Transaction** tab.")
+        else:
+            st.caption(
+                f"**{len(manual)}** manual transaction(s). "
+                "Click 🗑️ to delete individual entries."
+            )
+
+            # Column headers
+            h0, h1, h2, h3, h4, h5 = st.columns([2, 3, 2, 2, 2, 1])
+            h0.markdown("**Date**")
+            h1.markdown("**Merchant**")
+            h2.markdown("**Category**")
+            h3.markdown("**Type**")
+            h4.markdown("**Amount**")
+            h5.markdown("**Del**")
+            st.divider()
+
+            for i, row in manual.iterrows():
+                c0, c1, c2, c3, c4, c5 = st.columns([2, 3, 2, 2, 2, 1])
+                date_str = str(row["Transaction Date"])[:10]
+                c0.write(date_str)
+                c1.write(row["Merchant"])
+                c2.write(row["Category"])
+                c3.write(row["Type"])
+                c4.write(f"${float(row['Amount (USD)']):,.2f}")
+                if c5.button("🗑️", key=f"del_manual_{i}",
+                             help=f"Delete {row['Merchant']} on {date_str}"):
+                    with st.spinner("Deleting…"):
+                        full_df = load_transactions(sh).copy()
+                        # Match by fingerprint to avoid index drift
+                        drop_mask = (
+                            (full_df["Transaction Date"].astype(str).str[:10] == date_str) &
+                            (full_df["Merchant"] == row["Merchant"]) &
+                            (full_df["Amount (USD)"].astype(str) == str(row["Amount (USD)"])) &
+                            (full_df["Source"] == "Manual")
+                        )
+                        first_match = full_df[drop_mask].index[:1]
+                        if len(first_match):
+                            full_df = full_df.drop(index=first_match)
+                            save_all_transactions(sh, full_df)
+                            st.success(f"Deleted **{row['Merchant']}** on {date_str}.")
+                        else:
+                            st.error("Could not find the row to delete — try refreshing.")
+                    st.rerun()
+
+
 # ─── PAGE: MANAGE DATA ────────────────────────────────────────────────────────
 def page_manage(sh):
     st.title("⚙️ Manage Data")
@@ -1586,6 +1700,7 @@ def main():
                 "🎯 Budgets",
                 "📈 Trends",
                 "💡 Insights",
+                "✏️ Manual Entry",
                 "🤖 Rules",
                 "⚙️ Manage Data",
             ],
@@ -1611,6 +1726,7 @@ def main():
         "🎯 Budgets": page_budgets,
         "📈 Trends": page_trends,
         "💡 Insights": page_insights,
+        "✏️ Manual Entry": page_manual_entry,
         "🤖 Rules": page_rules,
         "⚙️ Manage Data": page_manage,
     }

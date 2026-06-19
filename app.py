@@ -1565,7 +1565,6 @@ def page_manual_entry(sh):
             tx_type   = fc4.selectbox("Type", ["Purchase", "Payment / Credit"])
             amount    = fc5.number_input("Amount ($)", min_value=0.0, step=0.01, format="%.2f")
 
-            description  = st.text_input("Description (optional)", placeholder="e.g. Birthday dinner")
             purchased_by = st.text_input("Purchased By (optional)", placeholder="Your name")
 
             submitted = st.form_submit_button("💾 Save Transaction", type="primary", use_container_width=True)
@@ -1582,7 +1581,7 @@ def page_manual_entry(sh):
                 new_row = pd.DataFrame([{
                     "Transaction Date": str(tx_dt.date()),
                     "Clearing Date":    str(tx_dt.date()),
-                    "Description":      description.strip(),
+                    "Description":      "",
                     "Merchant":         merchant.strip(),
                     "Category":         category,
                     "Type":             "Payment" if "Payment" in tx_type else "Purchase",

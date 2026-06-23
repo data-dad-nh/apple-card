@@ -47,6 +47,7 @@ NOTES_HEADERS = ["Period", "Note", "Updated"]
 
 RULES_HEADERS = ["Merchant", "Category", "Created"]
 COMMENTS_HEADERS = ["Key", "Comment", "Updated"]
+INCOME_HEADERS   = ["Period", "Source", "Amount", "Added"]
 
 DEFAULT_BUDGETS = {
     "Grocery": 600.0,
@@ -209,6 +210,62 @@ def save_comments(sh, comments: dict):
         ws.update([COMMENTS_HEADERS])
     load_comments.clear()
 
+
+@st.cache_data(ttl=90, show_spinner=False)
+def load_income(_sh):
+    """Returns DataFrame of income entries: Period, Source, Amount."""
+    ws = get_or_create_worksheet(_sh, "income")
+    data = ws.get_all_records()
+    if not data:
+        return pd.DataFrame(columns=INCOME_HEADERS)
+    df = pd.DataFrame(data)
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
+    return df
+
+
+def save_income_entry(sh, period: str, source: str, amount: float):
+    """Append a single income entry."""
+    ws = get_or_create_worksheet(sh, "income")
+    existing = ws.get_all_values()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not existing:
+        ws.update([INCOME_HEADERS, [period, source, amount, now]])
+    else:
+        ws.append_rows([[period, source, amount, now]])
+    load_income.clear()
+
+
+def delete_income_entry(sh, period: str, source: str, amount: float):
+    """Delete the first matching income row."""
+    ws = get_or_create_worksheet(sh, "income")
+    data = ws.get_all_records()
+    if not data:
+        return
+    df = pd.DataFrame(data)
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
+    mask = (df["Period"] == period) & (df["Source"] == source) & (df["Amount"] == amount)
+    keep = df[~mask | mask.cumsum().gt(1)]  # drop only the FIRST match
+    ws.clear()
+    if not keep.empty:
+        ws.update([INCOME_HEADERS] + keep[INCOME_HEADERS].values.tolist())
+    else:
+        ws.update([INCOME_HEADERS])
+    load_income.clear()
+
+
+def income_for_period(income_df: pd.DataFrame, period: str) -> float:
+    """Sum all income entries for a given YYYY-MM period string."""
+    if income_df.empty:
+        return 0.0
+    return float(income_df[income_df["Period"] == period]["Amount"].sum())
+
+
+def income_for_year(income_df: pd.DataFrame, year: str) -> float:
+    """Sum all income entries for a given year string."""
+    if income_df.empty:
+        return 0.0
+    return float(income_df[income_df["Period"].str.startswith(year)]["Amount"].sum())
+
 # ─── DATA SAVING ──────────────────────────────────────────────────────────────
 def save_transactions(sh, df_new: pd.DataFrame):
     ws = get_or_create_worksheet(sh, "transactions")
@@ -357,6 +414,7 @@ def page_dashboard(sh):
     budgets = load_budgets(sh)
     notes = load_notes(sh)
     comments = load_comments(sh)
+    income_df = load_income(sh)
 
     if df.empty or get_purchases(df).empty:
         st.info("👆 No data yet — head to **Upload** to add your first statement!")
@@ -374,14 +432,17 @@ def page_dashboard(sh):
     selected_period = pd.Period(sel)
     month_df = purchases[purchases["Transaction Date"].dt.to_period("M") == selected_period]
 
-    total_spent = month_df["Amount (USD)"].sum()
+    total_spent  = month_df["Amount (USD)"].sum()
     total_budget = sum(budgets.get(c, 0) for c in DEFAULT_BUDGETS)
-    remaining = total_budget - total_spent
-    avg_tx = month_df["Amount (USD)"].mean() if len(month_df) else 0
-    largest = month_df.nlargest(1, "Amount (USD)")
+    remaining    = total_budget - total_spent
+    avg_tx       = month_df["Amount (USD)"].mean() if len(month_df) else 0
+    largest      = month_df.nlargest(1, "Amount (USD)")
+    month_income = income_for_period(income_df, sel)
+    surplus      = month_income - total_spent
+    savings_rate = (surplus / month_income * 100) if month_income > 0 else None
 
-    # KPI row
-    c1, c2, c3, c4 = st.columns(4)
+    # KPI row — top
+    c1, c2, c3 = st.columns(3)
     with c1:
         metric_card("Total Spent", f"${total_spent:,.2f}",
                     f"${remaining:,.2f} {'remaining' if remaining >= 0 else 'over budget'}",
@@ -390,21 +451,53 @@ def page_dashboard(sh):
         metric_card("Monthly Budget", f"${total_budget:,.2f}",
                     f"{len(DEFAULT_BUDGETS)} categories tracked", "#48bb78")
     with c3:
+        avg_tx_val = month_df["Amount (USD)"].mean() if len(month_df) else 0
         metric_card("Transactions", str(len(month_df)),
-                    f"Avg ${avg_tx:,.2f} each", "#ed8936")
-    with c4:
-        top_merchant = largest.iloc[0]["Merchant"] if len(largest) else "—"
-        top_amt = largest.iloc[0]["Amount (USD)"] if len(largest) else 0
-        if len(largest):
-            top_key = make_tx_key(
-                largest.iloc[0]["Transaction Date"],
-                largest.iloc[0]["Merchant"],
-                largest.iloc[0]["Amount (USD)"],
-            )
-            top_comment = comments.get(top_key, "")
-            sub_label = f"💬 {top_comment}" if top_comment else top_merchant
+                    f"Avg ${avg_tx_val:,.2f} each", "#ed8936")
+
+    # KPI row — income row
+    i1, i2, i3 = st.columns(3)
+    with i1:
+        if month_income > 0:
+            metric_card("Take-Home Pay", f"${month_income:,.2f}",
+                        f"Entered for {sel}", "#00b4d8")
         else:
-            sub_label = "—"
+            metric_card("Take-Home Pay", "Not entered",
+                        "Add via 💵 Income page", "#aaaaaa")
+    with i2:
+        if month_income > 0:
+            color = "#38a169" if surplus >= 0 else "#e53e3e"
+            metric_card(
+                "Surplus / Deficit",
+                f"${surplus:+,.2f}",
+                f"{'Saved' if surplus >= 0 else 'Over'} vs take-home",
+                color,
+            )
+        else:
+            metric_card("Surplus / Deficit", "—", "Enter income to calculate", "#aaaaaa")
+    with i3:
+        if savings_rate is not None:
+            rate_color = "#38a169" if savings_rate >= 20 else "#ed8936" if savings_rate >= 0 else "#e53e3e"
+            metric_card("Savings Rate", f"{savings_rate:.1f}%",
+                        "≥20% is a healthy target", rate_color)
+        else:
+            metric_card("Savings Rate", "—", "Enter income to calculate", "#aaaaaa")
+
+    # Largest purchase card
+    top_merchant = largest.iloc[0]["Merchant"] if len(largest) else "—"
+    top_amt      = largest.iloc[0]["Amount (USD)"] if len(largest) else 0
+    if len(largest):
+        top_key = make_tx_key(
+            largest.iloc[0]["Transaction Date"],
+            largest.iloc[0]["Merchant"],
+            largest.iloc[0]["Amount (USD)"],
+        )
+        top_comment = comments.get(top_key, "")
+        sub_label = f"💬 {top_comment}" if top_comment else top_merchant
+    else:
+        sub_label = "—"
+    lp1, lp2, lp3 = st.columns(3)
+    with lp2:
         metric_card("Largest Purchase", f"${top_amt:,.2f}", sub_label, "#9f7aea")
 
     st.divider()
@@ -1012,6 +1105,7 @@ def page_trends(sh):
     purchases["Month#"] = purchases["Transaction Date"].dt.month
 
     budgets = load_budgets(sh)
+    income_df = load_income(sh)
     total_budget = sum(v for k, v in budgets.items())
 
     def color_change(val):
@@ -1043,6 +1137,15 @@ def page_trends(sh):
         )
         monthly["Budget"] = total_budget
 
+        # Join income by period
+        if not income_df.empty:
+            inc_by_period = income_df.groupby("Period")["Amount"].sum().reset_index()
+            monthly = monthly.merge(inc_by_period, on="Period", how="left").rename(
+                columns={"Amount": "Income"}
+            )
+        else:
+            monthly["Income"] = None
+
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=monthly["Period"], y=monthly["Total"],
@@ -1052,6 +1155,12 @@ def page_trends(sh):
             x=monthly["Period"], y=monthly["Budget"],
             name="Budget", line=dict(color="#e53e3e", width=2, dash="dash"),
         ))
+        if monthly["Income"].notna().any():
+            fig.add_trace(go.Scatter(
+                x=monthly["Period"], y=monthly["Income"],
+                name="Take-Home", line=dict(color="#00b4d8", width=2),
+                mode="lines+markers",
+            ))
         fig.update_layout(height=320, **CHART_LAYOUT)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1115,6 +1224,10 @@ def page_trends(sh):
             biggest_mo_amt = yr_df.groupby("Period")["Amount (USD)"].sum().max()
             top_cat      = yr_df.groupby("Category")["Amount (USD)"].sum().idxmax()
 
+            annual_income = income_for_year(income_df, sel_year)
+            annual_surplus = annual_income - total_yr
+            annual_savings_rate = (annual_surplus / annual_income * 100) if annual_income > 0 else None
+
             k1, k2, k3, k4 = st.columns(4)
             with k1:
                 metric_card("Total Spent", f"${total_yr:,.2f}",
@@ -1132,6 +1245,32 @@ def page_trends(sh):
                 top_cat_amt = yr_df.groupby("Category")["Amount (USD)"].sum().max()
                 metric_card("Top Category", f"${top_cat_amt:,.2f}",
                             top_cat, "#9f7aea")
+
+            # Income KPI row
+            i1, i2, i3, i4 = st.columns(4)
+            with i1:
+                if annual_income > 0:
+                    metric_card("Annual Take-Home", f"${annual_income:,.2f}",
+                                f"Avg ${annual_income/12:,.2f}/mo", "#00b4d8")
+                else:
+                    metric_card("Annual Take-Home", "Not entered",
+                                "Add via 💵 Income page", "#aaaaaa")
+            with i2:
+                if annual_income > 0:
+                    sc = "#38a169" if annual_surplus >= 0 else "#e53e3e"
+                    metric_card("Annual Surplus", f"${annual_surplus:+,.2f}",
+                                f"{'Saved' if annual_surplus >= 0 else 'Over'} vs take-home", sc)
+                else:
+                    metric_card("Annual Surplus", "—", "Enter income to calculate", "#aaaaaa")
+            with i3:
+                if annual_savings_rate is not None:
+                    rc = "#38a169" if annual_savings_rate >= 20 else "#ed8936" if annual_savings_rate >= 0 else "#e53e3e"
+                    metric_card("Savings Rate", f"{annual_savings_rate:.1f}%",
+                                "≥20% is a healthy target", rc)
+                else:
+                    metric_card("Savings Rate", "—", "Enter income to calculate", "#aaaaaa")
+            with i4:
+                metric_card("Biggest Month", f"${biggest_mo_amt:,.2f}", biggest_mo, "#ed8936")
 
             st.divider()
 
@@ -1158,6 +1297,14 @@ def page_trends(sh):
                 line_color="#e53e3e", annotation_text="Monthly Budget",
                 annotation_position="top left",
             )
+            if annual_income > 0:
+                monthly_income_avg = annual_income / 12
+                fig_yr.add_hline(
+                    y=monthly_income_avg, line_dash="dot",
+                    line_color="#00b4d8",
+                    annotation_text=f"Avg Monthly Income (${monthly_income_avg:,.0f})",
+                    annotation_position="bottom left",
+                )
             fig_yr.update_layout(height=320, showlegend=False, **CHART_LAYOUT)
             st.plotly_chart(fig_yr, use_container_width=True)
 
@@ -1443,6 +1590,108 @@ def page_insights(sh):
         )
 
 
+# ─── PAGE: INCOME ────────────────────────────────────────────────────────────
+def page_income(sh):
+    st.title("💵 Income")
+    st.markdown(
+        "Track your monthly take-home pay by source. "
+        "Income is used on the Dashboard and Trends page to calculate surplus and savings rate."
+    )
+
+    tab_add, tab_manage = st.tabs(["➕ Add Income", "📋 Manage Income"])
+
+    # ── Add income entry ──────────────────────────────────────────────────────
+    with tab_add:
+        with st.form("income_form", clear_on_submit=True):
+            f1, f2 = st.columns(2)
+            period_date = f1.date_input("Month", value=datetime.today().replace(day=1))
+            source = f2.text_input(
+                "Source", placeholder="e.g. Salary, Freelance, Rental Income"
+            )
+            amount = st.number_input(
+                "Take-Home Amount ($)", min_value=0.0, step=100.0, format="%.2f"
+            )
+            submitted = st.form_submit_button(
+                "💾 Save Income Entry", type="primary", use_container_width=True
+            )
+
+        if submitted:
+            if not source.strip():
+                st.error("Source is required.")
+            elif amount <= 0:
+                st.error("Amount must be greater than $0.")
+            else:
+                period_str = pd.Timestamp(period_date).strftime("%Y-%m")
+                with st.spinner("Saving…"):
+                    save_income_entry(sh, period_str, source.strip(), amount)
+                st.success(
+                    f"✅ Saved: **{source.strip()}** — "
+                    f"${amount:,.2f} for {pd.Timestamp(period_date).strftime('%B %Y')}"
+                )
+
+    # ── Manage income entries ─────────────────────────────────────────────────
+    with tab_manage:
+        income_df = load_income(sh)
+
+        if income_df.empty:
+            st.info("No income entries yet — add one in the **Add Income** tab.")
+        else:
+            # Summary by period
+            st.subheader("Monthly Summary")
+            summary = (
+                income_df.groupby("Period")["Amount"]
+                .agg(Total="sum", Sources="count")
+                .reset_index()
+                .sort_values("Period", ascending=False)
+            )
+            st.dataframe(
+                summary.style.format({"Total": "${:,.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Period":  st.column_config.TextColumn("Month"),
+                    "Total":   st.column_config.NumberColumn("Total Take-Home", format="$%.2f"),
+                    "Sources": st.column_config.NumberColumn("# Sources"),
+                },
+            )
+
+            st.divider()
+            st.subheader("All Entries")
+            st.caption("Click 🗑️ to delete an individual entry.")
+
+            # Header
+            h0, h1, h2, h3 = st.columns([2, 3, 2, 1])
+            h0.markdown("**Month**")
+            h1.markdown("**Source**")
+            h2.markdown("**Amount**")
+            h3.markdown("**Del**")
+            st.divider()
+
+            display = income_df.sort_values(
+                ["Period", "Source"], ascending=[False, True]
+            ).reset_index(drop=True)
+
+            for i, row in display.iterrows():
+                c0, c1, c2, c3 = st.columns([2, 3, 2, 1])
+                try:
+                    label = pd.Timestamp(row["Period"]).strftime("%B %Y")
+                except Exception:
+                    label = row["Period"]
+                c0.write(label)
+                c1.write(row["Source"])
+                c2.write(f"${float(row['Amount']):,.2f}")
+                if c3.button("🗑️", key=f"del_inc_{i}",
+                             help=f"Delete {row['Source']} {row['Period']}"):
+                    with st.spinner("Deleting…"):
+                        delete_income_entry(
+                            sh, row["Period"], row["Source"], float(row["Amount"])
+                        )
+                    st.success(
+                        f"Deleted **{row['Source']}** entry for {label}."
+                    )
+                    st.rerun()
+
+
 # ─── PAGE: RULES ─────────────────────────────────────────────────────────────
 def page_rules(sh):
     st.title("🤖 Category Rules")
@@ -1719,6 +1968,7 @@ def main():
                 "🎯 Budgets",
                 "📈 Trends",
                 "💡 Insights",
+                "💵 Income",
                 "✏️ Manual Entry",
                 "🤖 Rules",
                 "⚙️ Manage Data",
@@ -1733,6 +1983,7 @@ def main():
             load_notes.clear()
             load_rules.clear()
             load_comments.clear()
+            load_income.clear()
             st.rerun()
         if st.button("🔒 Log Out", use_container_width=True):
             st.session_state["authenticated"] = False
@@ -1745,6 +1996,7 @@ def main():
         "🎯 Budgets": page_budgets,
         "📈 Trends": page_trends,
         "💡 Insights": page_insights,
+        "💵 Income": page_income,
         "✏️ Manual Entry": page_manual_entry,
         "🤖 Rules": page_rules,
         "⚙️ Manage Data": page_manage,

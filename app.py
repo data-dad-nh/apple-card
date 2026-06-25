@@ -219,6 +219,8 @@ def load_income(_sh):
     if not data:
         return pd.DataFrame(columns=INCOME_HEADERS)
     df = pd.DataFrame(data)
+    if "Amount" not in df.columns:
+        df["Amount"] = 0.0
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
     return df
 
@@ -227,9 +229,15 @@ def save_income_entry(sh, period: str, source: str, amount: float):
     """Append a single income entry."""
     ws = get_or_create_worksheet(sh, "income")
     existing = ws.get_all_values()
+    # Filter empty rows — a brand-new gspread worksheet can return
+    # rows of empty strings which are truthy but have no real content.
+    existing = [r for r in existing if any(c.strip() for c in r)]
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not existing:
-        ws.update([INCOME_HEADERS, [period, source, amount, now]])
+    if not existing or existing[0] != INCOME_HEADERS:
+        # No real data yet, or headers are wrong — write fresh
+        data_rows = existing[1:] if existing else []
+        ws.clear()
+        ws.update([INCOME_HEADERS] + data_rows + [[period, source, amount, now]])
     else:
         ws.append_rows([[period, source, amount, now]])
     load_income.clear()

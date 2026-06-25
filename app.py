@@ -46,8 +46,9 @@ BUDGET_HEADERS = ["Category", "Monthly Budget"]
 NOTES_HEADERS = ["Period", "Note", "Updated"]
 
 RULES_HEADERS = ["Merchant", "Category", "Created"]
-COMMENTS_HEADERS = ["Key", "Comment", "Updated"]
-INCOME_HEADERS   = ["Period", "Source", "Amount", "Added"]
+COMMENTS_HEADERS       = ["Key", "Comment", "Updated"]
+INCOME_HEADERS         = ["Period", "Source", "Amount", "Added"]
+REIMBURSEMENTS_HEADERS = ["Key", "Amount", "Updated"]
 
 DEFAULT_BUDGETS = {
     "Grocery": 600.0,
@@ -209,6 +210,57 @@ def save_comments(sh, comments: dict):
     else:
         ws.update([COMMENTS_HEADERS])
     load_comments.clear()
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def load_reimbursements(_sh):
+    """Returns dict {tx_key: reimbursed_amount} from the reimbursements sheet."""
+    ws = get_or_create_worksheet(_sh, "reimbursements")
+    rows = ws.get_all_values()
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows or rows[0] != REIMBURSEMENTS_HEADERS:
+        return {}
+    data = rows[1:]
+    if not data:
+        return {}
+    result = {}
+    for row in data:
+        try:
+            result[row[0]] = float(row[1])
+        except (ValueError, IndexError):
+            pass
+    return result
+
+
+def save_reimbursements(sh, reimb: dict):
+    """Overwrite the entire reimbursements sheet with the provided dict."""
+    ws = get_or_create_worksheet(sh, "reimbursements")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows = [[k, v, now] for k, v in reimb.items() if v and float(v) > 0]
+    ws.clear()
+    if rows:
+        ws.update([REIMBURSEMENTS_HEADERS] + rows)
+    else:
+        ws.update([REIMBURSEMENTS_HEADERS])
+    load_reimbursements.clear()
+
+
+def apply_reimbursements(df: pd.DataFrame, reimb: dict) -> pd.DataFrame:
+    """Add 'Reimbursed' and 'Net Amount' columns to a purchases DataFrame.
+    Net Amount = Amount (USD) - Reimbursed, clamped to >= 0.
+    """
+    df = df.copy()
+    if not reimb:
+        df["Reimbursed"] = 0.0
+        df["Net Amount"] = df["Amount (USD)"]
+        return df
+    keys = df.apply(
+        lambda r: make_tx_key(r["Transaction Date"], r["Merchant"], r["Amount (USD)"]),
+        axis=1,
+    )
+    df["Reimbursed"] = keys.map(reimb).fillna(0.0).astype(float)
+    df["Net Amount"] = (df["Amount (USD)"] - df["Reimbursed"]).clip(lower=0)
+    return df
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -426,12 +478,13 @@ def page_dashboard(sh):
     notes = load_notes(sh)
     comments = load_comments(sh)
     income_df = load_income(sh)
+    reimb = load_reimbursements(sh)
 
     if df.empty or get_purchases(df).empty:
         st.info("👆 No data yet — head to **Upload** to add your first statement!")
         return
 
-    purchases = get_purchases(df)
+    purchases = apply_reimbursements(get_purchases(df), reimb)
     periods = available_periods(purchases)
 
     sel = st.selectbox(
@@ -443,14 +496,15 @@ def page_dashboard(sh):
     selected_period = pd.Period(sel)
     month_df = purchases[purchases["Transaction Date"].dt.to_period("M") == selected_period]
 
-    total_spent  = month_df["Amount (USD)"].sum()
+    total_spent  = month_df["Net Amount"].sum()
     total_budget = sum(budgets.get(c, 0) for c in DEFAULT_BUDGETS)
     remaining    = total_budget - total_spent
-    avg_tx       = month_df["Amount (USD)"].mean() if len(month_df) else 0
-    largest      = month_df.nlargest(1, "Amount (USD)")
-    month_income = income_for_period(income_df, sel)
-    surplus      = month_income - total_spent
-    savings_rate = (surplus / month_income * 100) if month_income > 0 else None
+    avg_tx       = month_df["Net Amount"].mean() if len(month_df) else 0
+    largest      = month_df.nlargest(1, "Net Amount")
+    month_income  = income_for_period(income_df, sel)
+    month_reimb   = month_df["Reimbursed"].sum()
+    surplus       = month_income - total_spent
+    savings_rate  = (surplus / month_income * 100) if month_income > 0 else None
 
     # KPI row — top
     c1, c2, c3 = st.columns(3)
@@ -467,7 +521,7 @@ def page_dashboard(sh):
                     f"Avg ${avg_tx_val:,.2f} each", "#ed8936")
 
     # KPI row — income row
-    i1, i2, i3 = st.columns(3)
+    i1, i2, i3, i4 = st.columns(4)
     with i1:
         if month_income > 0:
             metric_card("Take-Home Pay", f"${month_income:,.2f}",
@@ -493,6 +547,12 @@ def page_dashboard(sh):
                         "≥20% is a healthy target", rate_color)
         else:
             metric_card("Savings Rate", "—", "Enter income to calculate", "#aaaaaa")
+    with i4:
+        if month_reimb > 0:
+            metric_card("HSA Reimbursed", f"${month_reimb:,.2f}",
+                        "Excluded from spend totals", "#00b4d8")
+        else:
+            metric_card("HSA Reimbursed", "$0.00", "No reimbursements this month", "#aaaaaa")
 
     # Largest purchase card
     top_merchant = largest.iloc[0]["Merchant"] if len(largest) else "—"
@@ -515,10 +575,10 @@ def page_dashboard(sh):
 
     # Category spend vs budget
     cat_spend = (
-        month_df.groupby("Category")["Amount (USD)"]
+        month_df.groupby("Category")["Net Amount"]
         .sum()
         .reset_index()
-        .rename(columns={"Amount (USD)": "Spent"})
+        .rename(columns={"Net Amount": "Spent"})
     )
     cat_spend["Budget"] = cat_spend["Category"].map(budgets).fillna(0)
     cat_spend["Remaining"] = cat_spend["Budget"] - cat_spend["Spent"]
@@ -592,7 +652,7 @@ def page_dashboard(sh):
     with col_b:
         st.subheader("Top Merchants")
         top_m = (
-            month_df.groupby("Merchant")["Amount (USD)"]
+            month_df.groupby("Merchant")["Net Amount"]
             .sum()
             .sort_values(ascending=True)
             .tail(8)
@@ -600,7 +660,7 @@ def page_dashboard(sh):
         )
         fig3 = px.bar(
             top_m,
-            x="Amount (USD)",
+            x="Net Amount",
             y="Merchant",
             orientation="h",
             color_discrete_sequence=["#667eea"],
@@ -614,7 +674,7 @@ def page_dashboard(sh):
     with col_c:
         st.subheader("Daily Spend")
         daily = (
-            month_df.groupby(month_df["Transaction Date"].dt.date)["Amount (USD)"]
+            month_df.groupby(month_df["Transaction Date"].dt.date)["Net Amount"]
             .sum()
             .reset_index()
         )
@@ -891,14 +951,16 @@ def page_transactions(sh):
     with tab_edit:
         st.caption("Edit **Category** or add a **Comment** to any row. Click a cell, then save.")
 
-        # Load existing comments and join onto base
+        # Load existing comments and reimbursements and join onto base
         comments = load_comments(sh)
-        base["_tx_key"] = base.apply(
+        reimb    = load_reimbursements(sh)
+        base["_tx_key"]    = base.apply(
             lambda r: make_tx_key(r["Transaction Date"], r["Merchant"], r["Amount (USD)"]), axis=1
         )
-        base["Comment"] = base["_tx_key"].map(comments).fillna("")
+        base["Comment"]    = base["_tx_key"].map(comments).fillna("")
+        base["Reimbursed"] = base["_tx_key"].map(reimb).fillna(0.0).astype(float)
 
-        display_cols = ["Transaction Date", "Merchant", "Category", "Amount (USD)", "Purchased By", "Type", "Comment"]
+        display_cols = ["Transaction Date", "Merchant", "Category", "Amount (USD)", "Purchased By", "Type", "Reimbursed", "Comment"]
         edit_df = base[display_cols].copy().rename(columns={"Amount (USD)": "Amount"})
 
         edited = st.data_editor(
@@ -917,6 +979,12 @@ def page_transactions(sh):
                 "Amount": st.column_config.NumberColumn("Amount ($)", format="$%.2f", disabled=True),
                 "Purchased By": st.column_config.TextColumn("Purchased By", disabled=True),
                 "Type": st.column_config.TextColumn("Type", disabled=True),
+                "Reimbursed": st.column_config.NumberColumn(
+                    "💊 Reimbursed ($)",
+                    help="Amount reimbursed (e.g. via HSA). Excluded from spend totals.",
+                    min_value=0.0,
+                    format="$%.2f",
+                ),
                 "Comment": st.column_config.TextColumn(
                     "💬 Comment",
                     help="Optional note for this transaction",
@@ -938,6 +1006,8 @@ def page_transactions(sh):
             parts = []
             if n_cat:
                 parts.append(f"**{n_cat}** category change(s)")
+            if n_reimb:
+                parts.append(f"**{n_reimb}** reimbursement change(s)")
             if n_comment:
                 parts.append(f"**{n_comment}** comment change(s)")
             if parts:
@@ -963,6 +1033,18 @@ def page_transactions(sh):
                     full_df.loc[orig_indices, "Category"] = new_cats
                     save_all_transactions(sh, full_df)
 
+                # Save reimbursement changes
+                if n_reimb:
+                    updated_reimb = dict(reimb)
+                    for i, row in edited[reimb_changed_mask].iterrows():
+                        key = base.loc[i, "_tx_key"]
+                        val = float(row["Reimbursed"] or 0)
+                        if val > 0:
+                            updated_reimb[key] = val
+                        elif key in updated_reimb:
+                            del updated_reimb[key]  # zero = remove reimbursement
+                    save_reimbursements(sh, updated_reimb)
+
                 # Save comment changes to comments sheet
                 if n_comment:
                     updated_comments = dict(comments)  # copy existing
@@ -972,7 +1054,7 @@ def page_transactions(sh):
                         if new_comment:
                             updated_comments[key] = new_comment
                         elif key in updated_comments:
-                            del updated_comments[key]  # blank comment = delete it
+                            del updated_comments[key]
                     save_comments(sh, updated_comments)
 
             st.success(f"✅ Saved {n_changed} change(s)!")
@@ -1117,6 +1199,7 @@ def page_trends(sh):
 
     budgets = load_budgets(sh)
     income_df = load_income(sh)
+    reimb     = load_reimbursements(sh)
     total_budget = sum(v for k, v in budgets.items())
 
     def color_change(val):
@@ -1177,8 +1260,8 @@ def page_trends(sh):
 
     # ── Tab 2: Heatmap ────────────────────────────────────────────────────────
     with tab_heatmap:
-        cat_monthly = purchases.groupby(["Period", "Category"])["Amount (USD)"].sum().reset_index()
-        pivot = cat_monthly.pivot(index="Category", columns="Period", values="Amount (USD)").fillna(0)
+        cat_monthly = purchases.groupby(["Period", "Category"])["Net Amount"].sum().reset_index()
+        pivot = cat_monthly.pivot(index="Category", columns="Period", values="Net Amount").fillna(0)
         fig2 = px.imshow(
             pivot, color_continuous_scale="Blues",
             aspect="auto", text_auto="$.0f",
@@ -1196,8 +1279,8 @@ def page_trends(sh):
             p1 = cc1.selectbox("From", periods_avail, index=len(periods_avail) - 2, key="p1")
             p2 = cc2.selectbox("To",   periods_avail, index=len(periods_avail) - 1, key="p2")
 
-            s1  = purchases[purchases["Period"] == p1].groupby("Category")["Amount (USD)"].sum()
-            s2  = purchases[purchases["Period"] == p2].groupby("Category")["Amount (USD)"].sum()
+            s1  = purchases[purchases["Period"] == p1].groupby("Category")["Net Amount"].sum()
+            s2  = purchases[purchases["Period"] == p2].groupby("Category")["Net Amount"].sum()
             cmp = pd.DataFrame({"Previous": s1, "Current": s2}).fillna(0).reset_index()
             cmp["Change"]   = cmp["Current"] - cmp["Previous"]
             cmp["Change %"] = (cmp["Change"] / cmp["Previous"].replace(0, float("nan")) * 100).round(1)
@@ -1228,12 +1311,13 @@ def page_trends(sh):
         if yr_df.empty:
             st.info("No data for this year.")
         else:
-            total_yr     = yr_df["Amount (USD)"].sum()
+            yr_df        = apply_reimbursements(yr_df, reimb)
+            total_yr     = yr_df["Net Amount"].sum()
             months_in_yr = yr_df["Period"].nunique()
             avg_monthly  = total_yr / months_in_yr if months_in_yr else 0
-            biggest_mo   = yr_df.groupby("Period")["Amount (USD)"].sum().idxmax()
-            biggest_mo_amt = yr_df.groupby("Period")["Amount (USD)"].sum().max()
-            top_cat      = yr_df.groupby("Category")["Amount (USD)"].sum().idxmax()
+            biggest_mo   = yr_df.groupby("Period")["Net Amount"].sum().idxmax()
+            biggest_mo_amt = yr_df.groupby("Period")["Net Amount"].sum().max()
+            top_cat      = yr_df.groupby("Category")["Net Amount"].sum().idxmax()
 
             annual_income = income_for_year(income_df, sel_year)
             annual_surplus = annual_income - total_yr
@@ -1245,7 +1329,7 @@ def page_trends(sh):
                             f"{months_in_yr} month(s) of data", "#667eea")
             with k2:
                 over_budget_months = int(
-                    (yr_df.groupby("Period")["Amount (USD)"].sum() > total_budget).sum()
+                    (yr_df.groupby("Period")["Net Amount"].sum() > total_budget).sum()
                 )
                 metric_card("Avg / Month", f"${avg_monthly:,.2f}",
                             f"{over_budget_months} month(s) over budget", "#48bb78")
@@ -1253,7 +1337,7 @@ def page_trends(sh):
                 metric_card("Biggest Month", f"${biggest_mo_amt:,.2f}",
                             biggest_mo, "#ed8936")
             with k4:
-                top_cat_amt = yr_df.groupby("Category")["Amount (USD)"].sum().max()
+                top_cat_amt = yr_df.groupby("Category")["Net Amount"].sum().max()
                 metric_card("Top Category", f"${top_cat_amt:,.2f}",
                             top_cat, "#9f7aea")
 
@@ -1288,7 +1372,7 @@ def page_trends(sh):
             # 12-month bar chart for the selected year
             ALL_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
                           "Jul","Aug","Sep","Oct","Nov","Dec"]
-            mo_spend = yr_df.groupby("Month#")["Amount (USD)"].sum().reset_index()
+            mo_spend = yr_df.groupby("Month#")["Net Amount"].sum().reset_index()
             mo_spend["Month"] = mo_spend["Month#"].apply(lambda m: ALL_MONTHS[m - 1])
             # Fill missing months with zero
             full_mo = pd.DataFrame({"Month#": range(1, 13), "Month": ALL_MONTHS})
@@ -1325,7 +1409,7 @@ def page_trends(sh):
             col_l, col_r = st.columns(2)
             with col_l:
                 st.subheader("Category Breakdown")
-                cat_yr = yr_df.groupby("Category")["Amount (USD)"].sum().reset_index()
+                cat_yr = yr_df.groupby("Category")["Net Amount"].sum().reset_index()
                 cat_yr["Annual Budget"] = cat_yr["Category"].map(
                     {k: v * 12 for k, v in budgets.items()}
                 ).fillna(0)
@@ -1370,8 +1454,10 @@ def page_trends(sh):
             y2_df = purchases[purchases["Year"] == y2]
 
             # ── Top-line KPIs ────────────────────────────────────────────────
-            y1_total = y1_df["Amount (USD)"].sum()
-            y2_total = y2_df["Amount (USD)"].sum()
+            y1_df    = apply_reimbursements(y1_df, reimb)
+            y2_df    = apply_reimbursements(y2_df, reimb)
+            y1_total = y1_df["Net Amount"].sum()
+            y2_total = y2_df["Net Amount"].sum()
             delta_total = y2_total - y1_total
             delta_pct   = (delta_total / y1_total * 100) if y1_total else 0
 
@@ -1408,7 +1494,7 @@ def page_trends(sh):
                           "Jul","Aug","Sep","Oct","Nov","Dec"]
 
             def monthly_by_year(yr_purchases, label):
-                mo = yr_purchases.groupby("Month#")["Amount (USD)"].sum().reset_index()
+                mo = yr_purchases.groupby("Month#")["Net Amount"].sum().reset_index()
                 full = pd.DataFrame({"Month#": range(1, 13), "Month": ALL_MONTHS})
                 mo = full.merge(mo, on="Month#", how="left").fillna(0)
                 mo["Year"] = label
@@ -1442,8 +1528,8 @@ def page_trends(sh):
 
             # ── Category YoY table + chart ───────────────────────────────────
             st.subheader("Category Comparison")
-            s_y1 = y1_df.groupby("Category")["Amount (USD)"].sum()
-            s_y2 = y2_df.groupby("Category")["Amount (USD)"].sum()
+            s_y1 = y1_df.groupby("Category")["Net Amount"].sum()
+            s_y2 = y2_df.groupby("Category")["Net Amount"].sum()
             yoy  = pd.DataFrame({y1: s_y1, y2: s_y2}).fillna(0).reset_index()
             yoy["Δ $"]  = yoy[y2] - yoy[y1]
             yoy["Δ %"]  = (yoy["Δ $"] / yoy[y1].replace(0, float("nan")) * 100).round(1)
@@ -1505,7 +1591,8 @@ def page_insights(sh):
         st.info("No data yet.")
         return
 
-    purchases = get_purchases(df).copy()
+    reimb     = load_reimbursements(sh)
+    purchases = apply_reimbursements(get_purchases(df).copy(), reimb)
     purchases["Period"] = purchases["Transaction Date"].dt.to_period("M").astype(str)
     purchases["DOW"] = purchases["Transaction Date"].dt.day_name()
     purchases["Week"] = purchases["Transaction Date"].dt.isocalendar().week
@@ -1521,7 +1608,7 @@ def page_insights(sh):
         with col_a:
             st.subheader("All-Time Top Merchants")
             top = (
-                purchases.groupby("Merchant")["Amount (USD)"]
+                purchases.groupby("Merchant")["Net Amount"]
                 .agg(["sum", "count"])
                 .reset_index()
                 .rename(columns={"sum": "Total Spent", "count": "Visits"})
@@ -1535,8 +1622,8 @@ def page_insights(sh):
             )
         with col_b:
             st.subheader("Spend by Category (All Time)")
-            cat_all = purchases.groupby("Category")["Amount (USD)"].sum().reset_index()
-            fig = px.pie(cat_all, values="Amount (USD)", names="Category",
+            cat_all = purchases.groupby("Category")["Net Amount"].sum().reset_index()
+            fig = px.pie(cat_all, values="Net Amount", names="Category",
                          color="Category", color_discrete_map=CATEGORY_COLORS, hole=0.4)
             fig.update_layout(height=350, margin=dict(t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
@@ -1554,12 +1641,12 @@ def page_insights(sh):
         with c2:
             st.subheader("Avg Transaction by Category")
             avg_cat = (
-                purchases.groupby("Category")["Amount (USD)"]
+                purchases.groupby("Category")["Net Amount"]
                 .mean()
                 .sort_values(ascending=True)
                 .reset_index()
             )
-            fig = px.bar(avg_cat, x="Amount (USD)", y="Category", orientation="h",
+            fig = px.bar(avg_cat, x="Net Amount", y="Category", orientation="h",
                          color="Category", color_discrete_map=CATEGORY_COLORS)
             fig.update_layout(height=300, margin=dict(t=10, b=10, l=0, r=0),
                                showlegend=False,
@@ -1568,7 +1655,7 @@ def page_insights(sh):
 
     with tab3:
         total_budget = sum(v for k, v in budgets.items() if k in DEFAULT_BUDGETS)
-        monthly = purchases.groupby("Period")["Amount (USD)"].sum().reset_index()
+        monthly = purchases.groupby("Period")["Net Amount"].sum().reset_index()
         monthly["Budget"] = total_budget
         monthly["Delta"] = monthly["Budget"] - monthly["Amount (USD)"]
         monthly["Status"] = monthly["Delta"].apply(
@@ -1588,8 +1675,8 @@ def page_insights(sh):
         purchases["YearMonth"] = purchases["Transaction Date"].dt.to_period("M")
         recur = (
             purchases.groupby("Merchant")
-            .agg(Months=("YearMonth", "nunique"), Total=("Amount (USD)", "sum"),
-                 Count=("Amount (USD)", "count"), AvgAmt=("Amount (USD)", "mean"))
+            .agg(Months=("YearMonth", "nunique"), Total=("Net Amount", "sum"),
+                 Count=("Net Amount", "count"), AvgAmt=("Net Amount", "mean"))
             .reset_index()
         )
         recur = recur[recur["Months"] >= 2].sort_values("Total", ascending=False)
@@ -2004,6 +2091,7 @@ def main():
             load_rules.clear()
             load_comments.clear()
             load_income.clear()
+            load_reimbursements.clear()
             st.rerun()
         if st.button("🔒 Log Out", use_container_width=True):
             st.session_state["authenticated"] = False

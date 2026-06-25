@@ -1615,6 +1615,10 @@ def page_income(sh):
                 "💾 Save Income Entry", type="primary", use_container_width=True
             )
 
+        if st.session_state.get("income_save_success"):
+            msg = st.session_state.pop("income_save_success")
+            st.success(msg)
+
         if submitted:
             if not source.strip():
                 st.error("Source is required.")
@@ -1624,10 +1628,11 @@ def page_income(sh):
                 period_str = pd.Timestamp(period_date).strftime("%Y-%m")
                 with st.spinner("Saving…"):
                     save_income_entry(sh, period_str, source.strip(), amount)
-                st.success(
+                st.session_state["income_save_success"] = (
                     f"✅ Saved: **{source.strip()}** — "
                     f"${amount:,.2f} for {pd.Timestamp(period_date).strftime('%B %Y')}"
                 )
+                st.rerun()
 
     # ── Manage income entries ─────────────────────────────────────────────────
     with tab_manage:
@@ -1843,10 +1848,14 @@ def page_manual_entry(sh):
 }])
                 with st.spinner("Saving…"):
                     save_transactions(sh, new_row)
-                st.success(
+                st.session_state["manual_save_success"] = (
                     f"✅ Saved: **{merchant.strip()}** — "
                     f"${abs(stored_amount):,.2f} on {tx_dt.strftime('%B %d, %Y')}"
                 )
+                st.rerun()
+
+    if st.session_state.get("manual_save_success"):
+        st.success(st.session_state.pop("manual_save_success"))
 
     # ── Tab 2: Manage / delete manual entries ─────────────────────────────────
     with tab_manage:

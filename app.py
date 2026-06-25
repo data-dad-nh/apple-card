@@ -215,12 +215,15 @@ def save_comments(sh, comments: dict):
 def load_income(_sh):
     """Returns DataFrame of income entries: Period, Source, Amount."""
     ws = get_or_create_worksheet(_sh, "income")
-    data = ws.get_all_records()
+    # Use get_all_values so we can validate headers before trusting the data
+    rows = ws.get_all_values()
+    rows = [r for r in rows if any(c.strip() for c in r)]  # drop empty rows
+    if not rows or rows[0] != INCOME_HEADERS:
+        return pd.DataFrame(columns=INCOME_HEADERS)
+    data = rows[1:]
     if not data:
         return pd.DataFrame(columns=INCOME_HEADERS)
-    df = pd.DataFrame(data)
-    if "Amount" not in df.columns:
-        df["Amount"] = 0.0
+    df = pd.DataFrame(data, columns=INCOME_HEADERS)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
     return df
 
@@ -263,14 +266,14 @@ def delete_income_entry(sh, period: str, source: str, amount: float):
 
 def income_for_period(income_df: pd.DataFrame, period: str) -> float:
     """Sum all income entries for a given YYYY-MM period string."""
-    if income_df.empty:
+    if income_df.empty or "Period" not in income_df.columns:
         return 0.0
     return float(income_df[income_df["Period"] == period]["Amount"].sum())
 
 
 def income_for_year(income_df: pd.DataFrame, year: str) -> float:
     """Sum all income entries for a given year string."""
-    if income_df.empty:
+    if income_df.empty or "Period" not in income_df.columns:
         return 0.0
     return float(income_df[income_df["Period"].str.startswith(year)]["Amount"].sum())
 

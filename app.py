@@ -994,11 +994,15 @@ def page_transactions(sh):
             key="tx_editor",
         )
 
-        cat_changed_mask = edited["Category"].values != edit_df["Category"].values
+        cat_changed_mask   = edited["Category"].values != edit_df["Category"].values
         comment_changed_mask = edited["Comment"].fillna("").values != edit_df["Comment"].fillna("").values
-        any_changed_mask = cat_changed_mask | comment_changed_mask
-        n_cat = int(cat_changed_mask.sum())
+        reimb_changed_mask = (
+            edited["Reimbursed"].fillna(0).values != edit_df["Reimbursed"].fillna(0).values
+        )
+        any_changed_mask = cat_changed_mask | comment_changed_mask | reimb_changed_mask
+        n_cat     = int(cat_changed_mask.sum())
         n_comment = int(comment_changed_mask.sum())
+        n_reimb   = int(reimb_changed_mask.sum())
         n_changed = int(any_changed_mask.sum())
 
         sc1, sc2 = st.columns([3, 1])
